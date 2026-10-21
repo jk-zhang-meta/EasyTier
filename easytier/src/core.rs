@@ -1870,13 +1870,17 @@ pub async fn main() -> ExitCode {
     }
 
     let mut ret_code = 0;
+    let structured_status = cli.managed_status;
 
     if let Err(error) = run_main(cli).await {
         log::error!(%error);
         ret_code = 1;
     }
 
-    log::info!("Stopping easytier...");
+    // Keep the provisioning/status stdout a single parseable public JSON value.
+    if !structured_status {
+        log::info!("Stopping easytier...");
+    }
     set_prof_active(false);
 
     ExitCode::from(ret_code)
