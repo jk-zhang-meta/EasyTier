@@ -45,7 +45,7 @@ function Write-InstallRecord([string]$Status) {
     $Record = [ordered]@{format=1;platform='windows';core_sha256=$Digest;package_sha256=$PackageDigest;service_sha256=$DefinitionDigest;origin=$Origin;baseline='absent';status=$Status}
     $Tmp = Join-Path $Root ('.record-' + [guid]::NewGuid().ToString('N'))
     [IO.File]::WriteAllText($Tmp,($Record | ConvertTo-Json),[Text.UTF8Encoding]::new($false)); Set-PrivateAcl $Tmp
-    if (Test-Path -LiteralPath $RecordPath) { [IO.File]::Replace($Tmp,$RecordPath,$null) } else { [IO.File]::Move($Tmp,$RecordPath) }
+    if (Test-Path -LiteralPath $RecordPath) { [IO.File]::Replace($Tmp,$RecordPath,[System.Management.Automation.Language.NullString]::Value) } else { [IO.File]::Move($Tmp,$RecordPath) }
 }
 function Get-OwnedCommand([string]$Hash) {
     if ($Hash -cnotmatch '^[0-9a-f]{64}$') { throw 'Invalid owned version hash' }
