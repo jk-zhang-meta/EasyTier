@@ -25,20 +25,48 @@ function Set-PrivateAcl([string]$Path) {
     foreach ($Sid in $AllowedSids) { $Rule = New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier($Sid)),[Security.AccessControl.FileSystemRights]::FullControl,$Inheritance,[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow); $Acl.AddAccessRule($Rule) }
     Set-Acl -LiteralPath $Path -AclObject $Acl
 }
+function Get-PrivateTreeItem([string]$Path,[bool]$RequireProtected) {
+    $I = Get-Item -LiteralPath $Path -Force
+    if (($I.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Reparse point in private installation' }
+    $Acl = Get-Acl -LiteralPath $Path
+    if ($AllowedSids -notcontains $Acl.GetOwner([Security.Principal.SecurityIdentifier]).Value) { throw "Unexpected private path owner: $Path" }
+    if ($RequireProtected -and -not $Acl.AreAccessRulesProtected) { throw 'Private root inherits foreign access' }
+    $Rules = @($Acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))
+    if ($Rules.Count -ne 2) { throw "Unexpected private access entries: $Path" }
+    foreach ($Rule in $Rules) { if ($AllowedSids -notcontains $Rule.IdentityReference.Value -or $Rule.AccessControlType -ne 'Allow' -or $Rule.FileSystemRights -ne [Security.AccessControl.FileSystemRights]::FullControl) { throw "Unsafe private access: $Path" } }
+    return $I
+}
+function Test-VanishedNativeStateTemp([string]$Path,[Management.Automation.ErrorRecord]$Failure) {
+    # Native persist() uses basename.UUIDv4.tmp then atomic rename. No stable,
+    # unknown, untrusted-parent or access-denied failure is an ignorable race.
+    if ($Failure.Exception -isnot [Management.Automation.ItemNotFoundException] -or $Failure.CategoryInfo.Category -ne [Management.Automation.ErrorCategory]::ObjectNotFound) { return $false }
+    $Full = [IO.Path]::GetFullPath($Path); $StateFull = [IO.Path]::GetFullPath($State)
+    if (-not [string]::Equals([IO.Path]::GetDirectoryName($Full),$StateFull,[StringComparison]::OrdinalIgnoreCase)) { return $false }
+    if ([IO.Path]::GetFileName($Full) -cnotmatch '^(identity|public-identity|authority|watermark|status|directory)\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$') { return $false }
+    Assert-NoReparse $State
+    $null = Get-PrivateTreeItem $Root $true
+    $null = Get-PrivateTreeItem $State $true
+    try { $null = Get-Item -LiteralPath $Full -Force; return $false }
+    catch [Management.Automation.ItemNotFoundException] {
+        # A completed native rename must leave its stable, protected JSON entry.
+        $Stable = Join-Path $StateFull (([IO.Path]::GetFileName($Full) -split '\.')[0] + '.json')
+        $StableItem = Get-PrivateTreeItem $Stable $true
+        if ($StableItem.PSIsContainer) { return $false }
+        return $true
+    }
+}
 function Assert-PrivateTree([string]$Path) {
     Assert-NoReparse $Path
     $Queue = New-Object 'Collections.Generic.Queue[string]'; $Queue.Enqueue($Path); $Count = 0
+    $EnumeratedFiles = New-Object 'Collections.Generic.HashSet[string]'
     while ($Queue.Count -gt 0) {
         $P = $Queue.Dequeue(); $Count++; if ($Count -gt 512) { throw 'Private tree inspection cap exceeded' }
-        $I = Get-Item -LiteralPath $P -Force
-        if (($I.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Reparse point in private installation' }
-        $Acl = Get-Acl -LiteralPath $P
-        if ($AllowedSids -notcontains $Acl.GetOwner([Security.Principal.SecurityIdentifier]).Value) { throw "Unexpected private path owner: $P" }
-        if ($P -eq $Path -and -not $Acl.AreAccessRulesProtected) { throw 'Private root inherits foreign access' }
-        $Rules = @($Acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))
-        if ($Rules.Count -ne 2) { throw "Unexpected private access entries: $P" }
-        foreach ($Rule in $Rules) { if ($AllowedSids -notcontains $Rule.IdentityReference.Value -or $Rule.AccessControlType -ne 'Allow' -or $Rule.FileSystemRights -ne [Security.AccessControl.FileSystemRights]::FullControl) { throw "Unsafe private access: $P" } }
-        if ($I.PSIsContainer) { foreach ($Child in Get-ChildItem -LiteralPath $P -Force) { $Queue.Enqueue($Child.FullName) } }
+        try { $I = Get-PrivateTreeItem $P ($P -eq $Path) }
+        catch { if ($EnumeratedFiles.Contains($P) -and (Test-VanishedNativeStateTemp $P $_)) { continue }; throw }
+        if ($I.PSIsContainer) { foreach ($Child in Get-ChildItem -LiteralPath $P -Force) {
+            $Queue.Enqueue($Child.FullName)
+            if (-not $Child.PSIsContainer -and ($Child.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) { $null = $EnumeratedFiles.Add($Child.FullName) }
+        } }
     }
 }
 function Write-InstallRecord([string]$Status) {

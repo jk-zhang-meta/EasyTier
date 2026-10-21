@@ -70,3 +70,7 @@ try {
 }
 $Result.scratch_cleanup='removed_exact_owned_files_and_empty_directory'
 $Result | ConvertTo-Json -Depth 5
+# Keep the existing Windows CI entrypoint covering the live-state rename race.
+if ($Expectation -eq 'CandidatePass') {
+    & (Join-Path $PSScriptRoot 'test_private_tree_race.ps1') -CommonPath $CommonPath -Expectation CandidatePass
+}
