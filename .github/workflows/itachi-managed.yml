@@ -88,6 +88,31 @@ jobs:
         shell: bash
         run: |
           python -m zipfile -e dist-itachi/easytier-itachi-${{ matrix.platform }}-${{ matrix.arch }}.zip smoke-client
+          if [[ '${{ matrix.platform }}' == linux ]]; then
+            # Hosted images may make /opt runner-writable. Prepare a trusted
+            # ephemeral fixture, never weaken the distribution's installer.
+            [[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_ENVIRONMENT:-}" == github-hosted ]]
+            [[ -d /opt && ! -L /opt ]]
+            opt_stat=$(stat -c '%u %g %a' /opt)
+            printf 'Original CI /opt owner/group/mode: %s\n' "$opt_stat"
+            read -r opt_uid opt_gid opt_mode <<< "$opt_stat"
+            [[ "$opt_uid" =~ ^[0-9]+$ && "$opt_gid" =~ ^[0-9]+$ && "$opt_mode" =~ ^[0-7]{3,4}$ ]]
+            restore_ci_parent() {
+              local rc=$?
+              trap - EXIT
+              sudo chown "$opt_uid:$opt_gid" /opt || rc=1
+              sudo chmod "$opt_mode" /opt || rc=1
+              exit "$rc"
+            }
+            trap restore_ci_parent EXIT
+            sudo chown 0:0 /opt
+            sudo chmod 0755 /opt
+          else
+            # Keep macOS's parent trust check strict; record the actual hosted
+            # image metadata rather than assuming it matches Linux.
+            stat -f '%u %g %Lp' '/Library/Application Support'
+            ls -lde '/Library/Application Support'
+          fi
           sudo bash smoke-client/install.sh
           sudo bash smoke-client/install.sh
           if [[ '${{ matrix.platform }}' == linux ]]; then

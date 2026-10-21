@@ -27,6 +27,18 @@ const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMPV6_ECHO_REQUEST: u8 = 128;
 const ICMPV6_ECHO_REPLY: u8 = 129;
 
+// IPv6 extension-header fixtures are used only by the regression tests.
+#[cfg(test)]
+const IPV6_HOP_BY_HOP: u8 = 0;
+#[cfg(test)]
+const IPV6_ROUTING: u8 = 43;
+#[cfg(test)]
+const IPV6_FRAGMENT: u8 = 44;
+#[cfg(test)]
+const IPV6_AUTHENTICATION: u8 = 51;
+#[cfg(test)]
+const IPV6_DESTINATION_OPTIONS: u8 = 60;
+
 #[derive(Clone, Copy)]
 struct ParsedIpPacket<'a> {
     src_ip: IpAddr,
