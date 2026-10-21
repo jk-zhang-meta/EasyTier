@@ -26,30 +26,21 @@ def main():
     for name in ['install', 'uninstall', 'rollback', 'installer-common']:
         files[name + ext] = (Path(__file__).parent / (name + ext)).read_bytes()
     if a.platform == 'windows':
-        # Use only the driver DLL from the digest-verified upstream release;
-        # never substitute upstream's unmodified core for this fork's build.
-        url = 'https://api.github.com/repos/EasyTier/EasyTier/releases/tags/v2.7.0'
-        req = urllib.request.Request(url, headers={'User-Agent': 'EasyTier-Itachi-packager'})
-        with urllib.request.urlopen(req, timeout=30) as f:
-            metadata = json.loads(f.read(2 * 1024 * 1024))
-        upstream_arch = 'arm64' if a.arch == 'aarch64' else a.arch
-        name = 'easytier-windows-' + upstream_arch + '-v2.7.0.zip'
-        asset = next(x for x in metadata['assets'] if x['name'] == name)
-        digest = asset['digest']
-        if not digest or not digest.startswith('sha256:') or asset['size'] > 100 * 1024 * 1024:
-            raise ValueError('unverified upstream driver archive')
-        with urllib.request.urlopen(asset['browser_download_url'], timeout=90) as f:
-            raw = f.read(asset['size'] + 1)
-        if len(raw) != asset['size'] or 'sha256:' + hashlib.sha256(raw).hexdigest() != digest:
-            raise ValueError('upstream archive digest mismatch')
+        # Distribute only the official, digest-pinned prebuilt driver with its
+        # complete prebuilt-binary license, never an unmodified stock core.
+        url = 'https://www.wintun.net/builds/wintun-0.14.1.zip'
+        digest = '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51'
+        with urllib.request.urlopen(url, timeout=60) as f:
+            raw = f.read(8 * 1024 * 1024 + 1)
+        if len(raw) > 8 * 1024 * 1024 or hashlib.sha256(raw).hexdigest() != digest:
+            raise ValueError('official Wintun archive digest mismatch')
+        member = 'wintun/bin/' + ('arm64' if a.arch == 'aarch64' else 'amd64') + '/wintun.dll'
         with zipfile.ZipFile(io.BytesIO(raw)) as z:
-            names = [n for n in z.namelist() if Path(n).name.lower() == 'wintun.dll']
-            if len(names) != 1:
-                raise ValueError('ambiguous driver DLL')
-            files['wintun.dll'] = z.read(names[0])
+            files['wintun.dll'] = z.read(member)
+            files['WINTUN-LICENSE.txt'] = z.read('wintun/LICENSE.txt')
         files['DRIVER-PROVENANCE.json'] = json.dumps({
-            'archive': asset['browser_download_url'], 'sha256': digest.split(':')[1],
-            'member': names[0],
+            'archive': url, 'sha256': digest, 'member': member,
+            'license_member': 'wintun/LICENSE.txt', 'version': '0.14.1',
         }, indent=2).encode()
     files['LICENSE'] = (source / 'LICENSE').read_bytes()
     files['README.txt'] = (

@@ -53,13 +53,23 @@ jobs:
           toolchain: '1.99.0'
           target: ${{ matrix.target }}
           cache: false
+          # Match the project's ordinary cargo build; pinned upstream emits warnings.
+          rustflags: ''
       - uses: arduino/setup-protoc@v3
         with:
           version: '35.1'
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Focused managed runtime tests
         if: matrix.platform == 'linux' && matrix.arch == 'x86_64'
-        run: cargo test -j 2 -p easytier --lib --no-default-features --features management,tun,ring-crypto,cli,icmp-proxy,websocket,smoltcp managed::tests
+        shell: bash
+        run: |
+          cargo test -j 2 -p easytier --lib --no-default-features --features management,tun,ring-crypto,cli,icmp-proxy,websocket,smoltcp managed::tests --no-run --message-format=json > native-test-build.json
+          test_bin=$(python3 -c 'import json; rows=[json.loads(l) for l in open("native-test-build.json")]; bins=[r["executable"] for r in rows if r.get("reason")=="compiler-artifact" and r.get("profile",{}).get("test") and r.get("target",{}).get("name")=="easytier" and r.get("executable")]; assert len(bins)==1; print(bins[0])')
+          # Native SO_BINDTODEVICE tests exercise the privileged service path;
+          # compile as the runner user, elevate only the exact test executable.
+          sudo --preserve-env=RUST_BACKTRACE "$test_bin" managed::tests
+          python3 script/itachi/test_installers.py
+          sudo python3 script/itachi/test_installer_prepare.py
       - name: Focused native peer admission and packet security tests
         if: matrix.platform == 'linux' && matrix.arch == 'x86_64'
         shell: bash

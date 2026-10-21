@@ -3,7 +3,7 @@
 param()
 $ErrorActionPreference='Stop'
 function Test-Package([string]$Directory) {
-    $Required=@('easytier-core.exe','easytier-cli.exe','install.ps1','uninstall.ps1','rollback.ps1','installer-common.ps1','LICENSE','README.txt','wintun.dll','DRIVER-PROVENANCE.json')
+    $Required=@('easytier-core.exe','easytier-cli.exe','install.ps1','uninstall.ps1','rollback.ps1','installer-common.ps1','LICENSE','README.txt','wintun.dll','DRIVER-PROVENANCE.json','WINTUN-LICENSE.txt')
     foreach ($Name in @('SHA256SUMS','MANIFEST.json')+$Required) { $I=Get-Item -LiteralPath (Join-Path $Directory $Name) -Force; if ($I.PSIsContainer -or (($I.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Unsafe package member' } }
     $M=Get-Content -LiteralPath (Join-Path $Directory 'MANIFEST.json') -Raw | ConvertFrom-Json
     $Declared=@($M.files.PSObject.Properties)
