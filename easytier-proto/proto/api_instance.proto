@@ -56,6 +56,14 @@ message PeerInfo {
 
 message ListPeerRequest { InstanceIdentifier instance = 1; }
 
+// Bounded endpoint metadata. This is not packet capture or a verified full-route trace.
+message ListServiceFlowsRequest {
+  InstanceIdentifier instance = 1;
+  uint32 limit = 2; // capped at 256; zero returns collector health only
+}
+message ListServiceFlowsResponse { string snapshot_json = 1; }
+
+
 message ListPeerResponse {
   repeated PeerInfo peer_infos = 1;
   NodeInfo my_info = 2;
@@ -186,6 +194,7 @@ message GetForeignNetworkSummaryResponse {
 
 service PeerManageRpc {
   rpc ListPeer(ListPeerRequest) returns (ListPeerResponse);
+  rpc ListServiceFlows(ListServiceFlowsRequest) returns (ListServiceFlowsResponse);
   rpc ListPublicIpv6Info(ListPublicIpv6InfoRequest)
       returns (ListPublicIpv6InfoResponse);
   rpc ListRoute(ListRouteRequest) returns (ListRouteResponse);

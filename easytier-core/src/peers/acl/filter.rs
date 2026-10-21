@@ -65,139 +65,30 @@ impl ParsedIpPacket<'_> {
 }
 
 fn parse_ip_packet(payload: &[u8]) -> Option<ParsedIpPacket<'_>> {
-    let version = payload.first()? >> 4;
-    match version {
-        4 => parse_ipv4_packet(payload),
-        6 => parse_ipv6_packet(payload),
-        _ => None,
+    let p = crate::peers::service_flows::parse_ip_packet(payload)?;
+    match p.ports_unavailable {
+        Some(
+            "malformed_or_excessive_ipv6_extensions"
+            | "truncated_tcp_header"
+            | "invalid_tcp_header_length"
+            | "truncated_udp_header"
+            | "invalid_udp_length",
+        ) => return None,
+        _ => {}
     }
-}
-
-fn parse_ipv4_packet(payload: &[u8]) -> Option<ParsedIpPacket<'_>> {
-    if payload.len() < 20 {
-        return None;
-    }
-    let header_len = usize::from(payload[0] & 0x0f) * 4;
-    let options_len = header_len.saturating_sub(20);
-    let payload_offset = 20 + options_len;
-    let payload_start = payload_offset.min(payload.len());
-    let total_length = usize::from(u16::from_be_bytes([payload[2], payload[3]]));
-    let payload_len = total_length.saturating_sub(header_len);
-    let payload_end = payload_start.saturating_add(payload_len).min(payload.len());
-
+    // Tails retain only address/group evidence. Never treat fragment body bytes as ports.
+    let protocol =
+        if p.non_initial_fragment && p.protocol != IP_PROTO_ICMPV6 && p.protocol != IP_PROTO_ICMP {
+            IP_PROTO_UNSPECIFIED
+        } else {
+            p.protocol
+        };
     Some(ParsedIpPacket {
-        src_ip: IpAddr::V4(Ipv4Addr::new(
-            payload[12],
-            payload[13],
-            payload[14],
-            payload[15],
-        )),
-        dst_ip: IpAddr::V4(Ipv4Addr::new(
-            payload[16],
-            payload[17],
-            payload[18],
-            payload[19],
-        )),
-        protocol: payload[9],
-        transport_payload: payload.get(payload_start..payload_end)?,
-        is_non_initial_fragment: u16::from_be_bytes([payload[6], payload[7]]) & 0x1fff != 0,
-    })
-}
-
-fn parse_ipv6_packet(payload: &[u8]) -> Option<ParsedIpPacket<'_>> {
-    if payload.len() < 40 {
-        return None;
-    }
-
-    // A valid base header still supplies the addresses needed for ACL rules,
-    // even when the upper-layer headers cannot be decoded.
-    let parsed = ParsedIpPacket {
-        src_ip: IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&payload[8..24]).ok()?)),
-        dst_ip: IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&payload[24..40]).ok()?)),
-        protocol: IP_PROTO_UNSPECIFIED,
-        transport_payload: &[],
-        is_non_initial_fragment: false,
-    };
-
-    let payload_len = usize::from(u16::from_be_bytes([payload[4], payload[5]]));
-    let payload_end = 40usize.saturating_add(payload_len).min(payload.len());
-    let mut protocol = payload[6];
-    let mut payload_offset = 40;
-    let mut is_non_initial_fragment = false;
-    let mut saw_fragment_header = false;
-
-    loop {
-        match protocol {
-            IPV6_HOP_BY_HOP | IPV6_ROUTING | IPV6_DESTINATION_OPTIONS => {
-                let header = &payload[payload_offset..payload_end];
-                let Some(&header_len) = header.get(1) else {
-                    return Some(parsed);
-                };
-                let extension_len = (usize::from(header_len) + 1) * 8;
-                let next_protocol = header[0];
-                let extension_end = payload_offset + extension_len;
-                if extension_end > payload_end {
-                    return Some(parsed);
-                }
-                protocol = next_protocol;
-                payload_offset = extension_end;
-            }
-            IPV6_AUTHENTICATION => {
-                let header = &payload[payload_offset..payload_end];
-                let Some(&header_len) = header.get(1) else {
-                    return Some(parsed);
-                };
-                let extension_len = (usize::from(header_len) + 2) * 4;
-                let next_protocol = header[0];
-                let extension_end = payload_offset + extension_len;
-                if extension_end > payload_end {
-                    return Some(parsed);
-                }
-                protocol = next_protocol;
-                payload_offset = extension_end;
-            }
-            IPV6_FRAGMENT => {
-                if saw_fragment_header {
-                    return Some(parsed);
-                }
-                saw_fragment_header = true;
-
-                let fragment_end = payload_offset + 8;
-                if fragment_end > payload_end {
-                    return Some(parsed);
-                }
-                let header = &payload[payload_offset..fragment_end];
-                let fragment_field = u16::from_be_bytes([header[2], header[3]]);
-                is_non_initial_fragment = fragment_field & 0xfff8 != 0;
-                let next_protocol = header[0];
-                payload_offset = fragment_end;
-
-                protocol = next_protocol;
-                if is_non_initial_fragment {
-                    // Extension headers after the Fragment Header are only in the first
-                    // fragment. Do not interpret tail data as an extension header.
-                    // Only ICMPv6 tails can use the response records without a
-                    // transport header. Leave other tails to address/group ACLs.
-                    if protocol != IP_PROTO_ICMPV6 {
-                        protocol = IP_PROTO_UNSPECIFIED;
-                    }
-                    break;
-                }
-            }
-            _ => break,
-        }
-    }
-
-    let transport_payload = &payload[payload_offset..payload_end];
-    if payload_offset != 40 && parse_transport_ports(protocol, transport_payload).is_none() {
-        return Some(parsed);
-    }
-
-    Some(ParsedIpPacket {
+        src_ip: p.src_ip,
+        dst_ip: p.dst_ip,
         protocol,
-        transport_payload,
-        is_non_initial_fragment,
-        ..parsed
+        transport_payload: p.transport_payload,
+        is_non_initial_fragment: p.non_initial_fragment,
     })
 }
 
@@ -500,8 +391,9 @@ impl AclFilter {
                         if is_in { "inbound" } else { "outbound" },
                         packet.peer_manager_header()
                     );
-                    // allow all unknown packets
-                    return true;
+                    // With ACL enabled, malformed Data must not bypass restricted service rules.
+                    // Non-Data overlay control packets were already excluded above.
+                    return false;
                 }
             };
 
@@ -607,6 +499,7 @@ mod tests {
         packet[16..20].copy_from_slice(&[10, 0, 0, 2]);
         packet[20..22].copy_from_slice(&1234u16.to_be_bytes());
         packet[22..24].copy_from_slice(&80u16.to_be_bytes());
+        packet[32] = 0x50;
 
         let parsed = parse_ip_packet(&packet).unwrap();
         let (src_port, dst_port) =
@@ -631,6 +524,7 @@ mod tests {
         packet[24..40].copy_from_slice(&dst.octets());
         packet[40..42].copy_from_slice(&5353u16.to_be_bytes());
         packet[42..44].copy_from_slice(&53u16.to_be_bytes());
+        packet[44..46].copy_from_slice(&8u16.to_be_bytes());
 
         let parsed = parse_ip_packet(&packet).unwrap();
         let (src_port, dst_port) =
@@ -654,10 +548,7 @@ mod tests {
         packet[20..22].copy_from_slice(&1234u16.to_be_bytes());
         packet[22..24].copy_from_slice(&80u16.to_be_bytes());
 
-        let parsed = parse_ip_packet(&packet).unwrap();
-
-        assert_eq!(parsed.transport_payload.len(), 4);
-        assert!(parse_transport_ports(parsed.protocol, parsed.transport_payload).is_none());
+        assert!(parse_ip_packet(&packet).is_none());
     }
 
     #[test]
@@ -669,49 +560,23 @@ mod tests {
         packet[40..42].copy_from_slice(&5353u16.to_be_bytes());
         packet[42..44].copy_from_slice(&53u16.to_be_bytes());
 
-        let parsed = parse_ip_packet(&packet).unwrap();
-
-        assert_eq!(parsed.transport_payload.len(), 4);
-        assert!(parse_transport_ports(parsed.protocol, parsed.transport_payload).is_none());
+        assert!(parse_ip_packet(&packet).is_none());
     }
 
     #[test]
-    fn parse_ipv4_keeps_pnet_ihl_less_than_five_behavior() {
-        let mut packet = vec![0u8; 40];
-        packet[0] = 0x44;
-        packet[2..4].copy_from_slice(&40u16.to_be_bytes());
-        packet[9] = IP_PROTO_TCP;
-        packet[20..22].copy_from_slice(&1234u16.to_be_bytes());
-        packet[22..24].copy_from_slice(&80u16.to_be_bytes());
-
-        let parsed = parse_ip_packet(&packet).unwrap();
-        let (src_port, dst_port) =
-            parse_transport_ports(parsed.protocol, parsed.transport_payload).unwrap();
-
-        assert_eq!(parsed.transport_payload.len(), 20);
-        assert_eq!(src_port, Some(1234));
-        assert_eq!(dst_port, Some(80));
-    }
-
-    #[test]
-    fn parse_ipv4_keeps_pnet_truncated_options_behavior() {
-        let mut packet = vec![0u8; 20];
-        packet[0] = 0x4f;
-        packet[2..4].copy_from_slice(&60u16.to_be_bytes());
-        packet[9] = IP_PROTO_ICMP;
-        packet[12..16].copy_from_slice(&[10, 0, 0, 1]);
-        packet[16..20].copy_from_slice(&[10, 0, 0, 2]);
-
-        let parsed = parse_ip_packet(&packet).unwrap();
-        let (src_port, dst_port) =
-            parse_transport_ports(parsed.protocol, parsed.transport_payload).unwrap();
-
-        assert_eq!(parsed.src_ip, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
-        assert_eq!(parsed.dst_ip, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
-        assert_eq!(acl_protocol(parsed.protocol), Protocol::Icmp);
-        assert!(parsed.transport_payload.is_empty());
-        assert_eq!(src_port, None);
-        assert_eq!(dst_port, None);
+    fn parse_ipv4_rejects_invalid_ihl_and_truncated_options() {
+        for (size, ihl, total) in [
+            (40usize, 0x44, 40u16),
+            (20, 0x4f, 60),
+            (40, 0x45, 19),
+            (40, 0x45, 41),
+        ] {
+            let mut packet = vec![0u8; size];
+            packet[0] = ihl;
+            packet[2..4].copy_from_slice(&total.to_be_bytes());
+            packet[9] = IP_PROTO_TCP;
+            assert!(parse_ip_packet(&packet).is_none());
+        }
     }
 
     #[test]
@@ -795,11 +660,7 @@ mod tests {
                 );
                 packet[code_offset] = 0;
                 packet.pop();
-                assert!(
-                    !parse_ip_packet(&packet)
-                        .unwrap()
-                        .can_use_allow_record(is_in)
-                );
+                assert!(parse_ip_packet(&packet).is_none());
             }
             let packet = icmp_packet(ipv6, 3, 0);
             let parsed = parse_ip_packet(&packet).unwrap();
@@ -831,12 +692,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_ipv6_keeps_addresses_when_fragment_header_exceeds_declared_payload() {
+    fn parse_ipv6_rejects_fragment_header_exceeding_declared_payload() {
         let mut packet = icmp_packet(true, ICMPV6_ECHO_REPLY, 0);
         packet[4..6].copy_from_slice(&12u16.to_be_bytes());
-        let parsed = parse_ip_packet(&packet).unwrap();
-        assert_eq!(parsed.protocol, IP_PROTO_UNSPECIFIED);
-        assert!(!parsed.can_use_allow_record(true));
+        // The validated shared parser identifies an incomplete extension
+        // header. An enabled ACL must not turn it into an unrestricted packet.
+        assert!(parse_ip_packet(&packet).is_none());
     }
 
     struct TestRoute;
@@ -885,14 +746,18 @@ mod tests {
         let mut packet = ZCPacket::new_with_payload(&bytes);
         packet.fill_peer_manager_hdr(1, 2, PacketType::Data as u8);
         let filter = AclFilter::new();
-        let (info, can_use_allow_record) = filter
-            .extract_packet_info(&packet, true, &TestRoute)
-            .unwrap();
-        assert_eq!(info.src_ip, IpAddr::V6(src));
-        assert_eq!(info.dst_ip, IpAddr::V6(dst));
-        assert_eq!(info.protocol, Protocol::Unspecified);
-        assert_eq!((info.src_port, info.dst_port), (None, None));
-        assert!(!can_use_allow_record);
+        let extracted = filter.extract_packet_info(&packet, true, &TestRoute);
+        let malformed = parse_ip_packet(&bytes).is_none();
+        if malformed {
+            assert!(extracted.is_none());
+        } else {
+            let (info, can_use_allow_record) = extracted.unwrap();
+            assert_eq!(info.src_ip, IpAddr::V6(src));
+            assert_eq!(info.dst_ip, IpAddr::V6(dst));
+            assert_eq!(info.protocol, Protocol::Unspecified);
+            assert_eq!((info.src_port, info.dst_port), (None, None));
+            assert!(!can_use_allow_record);
+        }
 
         // Unknown payloads still obey the chain policy, and cannot match a
         // transport port rule using bytes that only happen to look like ports.
@@ -922,15 +787,18 @@ mod tests {
             }));
             assert_eq!(
                 filter.process_packet_with_acl(&packet, true, None, |ip| ip == dst, &TestRoute),
-                action == Action::Allow,
+                !malformed && action == Action::Allow,
             );
-            assert!(filter.process_packet_with_acl(&packet, false, None, |_| false, &TestRoute));
+            assert_eq!(
+                filter.process_packet_with_acl(&packet, false, None, |_| false, &TestRoute),
+                !malformed
+            );
             assert!(filter.outbound_allow_records.is_empty());
         }
     }
 
     #[tokio::test]
-    async fn ipv6_malformed_extension_headers_follow_acl() {
+    async fn ipv6_malformed_extension_headers_fail_closed() {
         for protocol in [
             IPV6_HOP_BY_HOP,
             IPV6_ROUTING,
@@ -986,6 +854,57 @@ mod tests {
                 payload.resize(8 + len, 0);
                 assert_ipv6_unknown_payload_follows_acl(IPV6_FRAGMENT, &payload);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_data_drops_both_directions_only_when_acl_enabled() {
+        let filter = AclFilter::new();
+        let mut variants = Vec::new();
+        for (size, ihl, total, proto) in [
+            (40usize, 0x44, 40u16, 6u8),
+            (20, 0x4f, 60, 6),
+            (40, 0x45, 41, 6),
+            (24, 0x45, 24, 6),
+            (24, 0x45, 24, 17),
+        ] {
+            let mut b = vec![0u8; size];
+            b[0] = ihl;
+            b[2..4].copy_from_slice(&total.to_be_bytes());
+            b[9] = proto;
+            variants.push(b);
+        }
+        let mut malformed_ipv6 = icmp_packet(true, ICMPV6_ECHO_REPLY, 0);
+        malformed_ipv6[4..6].copy_from_slice(&12u16.to_be_bytes());
+        variants.push(malformed_ipv6);
+        for bytes in variants {
+            let mut packet = ZCPacket::new_with_payload(&bytes);
+            packet.fill_peer_manager_hdr(1, 2, PacketType::Data as u8);
+            filter.reload_rules(None);
+            assert!(filter.process_packet_with_acl(&packet, false, None, |_| false, &TestRoute));
+            filter.reload_rules(Some(&Acl {
+                acl_v1: Some(AclV1 {
+                    chains: vec![Chain {
+                        name: "outbound".into(),
+                        chain_type: ChainType::Outbound as i32,
+                        enabled: true,
+                        default_action: Action::Allow as i32,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            }));
+            for inbound in [false, true] {
+                assert!(!filter.process_packet_with_acl(
+                    &packet,
+                    inbound,
+                    None,
+                    |_| false,
+                    &TestRoute
+                ));
+            }
+            packet.fill_peer_manager_hdr(1, 2, PacketType::Ping as u8);
+            assert!(filter.process_packet_with_acl(&packet, false, None, |_| false, &TestRoute));
         }
     }
 

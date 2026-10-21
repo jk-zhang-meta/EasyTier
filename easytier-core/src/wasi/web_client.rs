@@ -435,6 +435,7 @@ mod tests {
             managed_credentials: vec![ManagedCredentialConfig {
                 credential_id: "managed".to_owned(),
                 credential_secret: "secret".to_owned(),
+                credential_public_key: None,
                 ..Default::default()
             }],
             port_forwards: vec![crate::proto::api::manage::PortForwardConfig {

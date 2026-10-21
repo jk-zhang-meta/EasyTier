@@ -12,6 +12,7 @@ pub(crate) mod peer_rpc;
 pub mod public_ipv6;
 pub(crate) mod relay_peer_map;
 pub(crate) mod route;
+pub mod service_flows;
 pub(crate) mod traffic_metrics;
 mod util;
 pub(crate) mod whitelist;

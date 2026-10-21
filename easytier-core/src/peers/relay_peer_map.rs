@@ -154,6 +154,27 @@ impl RelayPeerMap {
         })
     }
 
+    fn require_managed_key(&self, key: &[u8]) -> Result<(), Error> {
+        if self.context.flags().managed_peer_auth_required
+            && (key.len() != 32 || !self.context.is_managed_pubkey_authorized(key))
+        {
+            return Err(Error::RouteError(Some(
+                "relay peer has no current exact public-key authorization".into(),
+            )));
+        }
+        Ok(())
+    }
+    fn require_managed_session(&self, session: &PeerSession) -> Result<(), Error> {
+        if self.context.flags().managed_peer_auth_required {
+            let key = session.peer_static_pubkey().unwrap_or([0; 32]);
+            if let Err(error) = self.require_managed_key(&key) {
+                session.invalidate();
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     pub fn is_secure_mode_enabled(&self) -> bool {
         self.is_secure_mode_enabled
     }
@@ -270,6 +291,10 @@ impl RelayPeerMap {
     }
 
     async fn flush_pending_packets(&self, dst_peer_id: PeerId, session: Arc<PeerSession>) {
+        if self.require_managed_session(&session).is_err() {
+            self.pending_packets.remove(&dst_peer_id);
+            return;
+        }
         let packets = self.pending_packets.remove(&dst_peer_id).map(|(_, v)| v);
         let Some(packets) = packets else { return };
         if packets.is_empty() {
@@ -310,6 +335,7 @@ impl RelayPeerMap {
         let network = self.context.network_identity();
         let key = SessionKey::new(network.network_name.clone(), dst_peer_id);
         if let Some(session) = self.peer_session_store.get(&key) {
+            self.require_managed_session(&session)?;
             return Ok(session);
         }
 
@@ -337,6 +363,7 @@ impl RelayPeerMap {
         let network = self.context.network_identity();
         let key = SessionKey::new(network.network_name.clone(), dst_peer_id);
         if let Some(session) = self.peer_session_store.get(&key) {
+            self.require_managed_session(&session)?;
             self.flush_pending_packets(dst_peer_id, session).await;
             return Ok(());
         }
@@ -389,6 +416,7 @@ impl RelayPeerMap {
         let session_key = SessionKey::new(network.network_name.clone(), dst_peer_id);
         let (local_private_key, _local_public_key) = self.get_local_keypair()?;
         let remote_static = self.get_remote_static_pubkey(dst_peer_id).await?;
+        self.require_managed_key(&remote_static)?;
         let params: NoiseParams = "Noise_IK_25519_ChaChaPoly_SHA256"
             .parse()
             .map_err(|e| Error::RouteError(Some(format!("parse noise params failed: {e:?}"))))?;
@@ -470,6 +498,7 @@ impl RelayPeerMap {
             PeerConnSessionActionPb::Sync => PeerSessionAction::Sync,
             PeerConnSessionActionPb::Create => PeerSessionAction::Create,
         };
+        self.require_managed_key(&remote_static)?;
         let remote_static_key = if remote_static.len() == 32 {
             let mut key = [0u8; 32];
             key.copy_from_slice(&remote_static);
@@ -623,6 +652,7 @@ impl RelayPeerMap {
             .get_remote_static()
             .map(|x: &[u8]| x.to_vec())
             .unwrap_or_default();
+        self.require_managed_key(&remote_static)?;
         let remote_static_key = if remote_static.len() == 32 {
             let mut key = [0u8; 32];
             key.copy_from_slice(&remote_static);
@@ -714,6 +744,7 @@ impl RelayPeerMap {
             self.ensure_session(from_peer_id, handshake_policy).await?;
             return Ok(false);
         };
+        self.require_managed_session(&session)?;
         let now = Instant::now();
         let mut entry = self.states.entry(from_peer_id).or_default();
         entry.last_active_at = now;

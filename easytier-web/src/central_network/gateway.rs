@@ -95,6 +95,7 @@ impl GatewayRuntimeSpec {
             .map(|credential| ManagedCredentialConfig {
                 credential_id: credential.id.clone(),
                 credential_secret: credential.secret.clone(),
+                credential_public_key: None,
                 groups: credential.grant.acl_groups.clone(),
                 allow_relay: credential.grant.allow_relay,
                 allowed_proxy_cidrs: credential.grant.allowed_proxy_cidrs.clone(),

@@ -988,6 +988,7 @@ mod tests {
         desired.managed_credentials = vec![ManagedCredentialConfig {
             credential_id: "managed".to_owned(),
             credential_secret: "credential-secret".to_owned(),
+            credential_public_key: None,
             expiry_unix: 2_000_000_000,
             ..Default::default()
         }];

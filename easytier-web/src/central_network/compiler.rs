@@ -504,6 +504,7 @@ fn compile_managed_credential(credential: &NetworkCredentialIntent) -> ManagedCr
     ManagedCredentialConfig {
         credential_id: credential.id.clone(),
         credential_secret: credential.secret.clone(),
+        credential_public_key: None,
         groups: grant.acl_groups,
         allow_relay: grant.allow_relay,
         allowed_proxy_cidrs: grant.allowed_proxy_cidrs,

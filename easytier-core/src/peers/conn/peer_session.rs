@@ -302,6 +302,10 @@ impl PeerSession {
         self.datagram.session_generation()
     }
 
+    pub fn peer_static_pubkey(&self) -> Option<[u8; 32]> {
+        *self.peer_static_pubkey.read().unwrap()
+    }
+
     pub fn root_key(&self) -> [u8; 32] {
         self.datagram.root_key()
     }

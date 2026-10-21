@@ -36,6 +36,7 @@ use crate::{
     config::peers::PeerGroupIdentity,
     peers::{
         PeerPacketFilter,
+        conn::peer_session::{PeerSessionStore, SessionKey},
         context::{
             ArcPeerContext, NetworkIdentity as CoreNetworkIdentity, PeerContext, PeerContextEvent,
             TrustedKeyMetadata, TrustedKeySource,
@@ -891,6 +892,7 @@ struct InterfacePeerSnapshot {
 
 // constructed with all infos synced from all peers.
 struct SyncedRouteInfo {
+    context: ArcPeerContext,
     default_easytier_version: String,
     peer_infos: RwLock<OrderedHashMap<PeerId, RoutePeerInfo>>,
     // Keep the original protobuf bytes so unknown fields survive multi-hop propagation.
@@ -1009,6 +1011,26 @@ impl SyncedRouteInfo {
     ) {
         let mut all_trusted = HashMap::new();
         let mut global_trusted_keys = HashMap::new();
+
+        if let Some(grants) = self.context.managed_credential_grants() {
+            // This snapshot was authenticated by the HTTPS authority. Route
+            // announcements, admin/root proofs and remote group claims cannot
+            // extend or replace it in managed mode.
+            for grant in grants {
+                if grant.pubkey.len() != 32 || grant.expiry_unix <= now {
+                    continue;
+                }
+                global_trusted_keys.insert(
+                    grant.pubkey.clone(),
+                    TrustedKeyMetadata {
+                        source: TrustedKeySource::OspfCredential,
+                        expiry_unix: Some(grant.expiry_unix),
+                    },
+                );
+                all_trusted.insert(grant.pubkey.clone(), grant);
+            }
+            return (all_trusted, global_trusted_keys);
+        }
 
         for (peer_id, info) in peer_infos.iter() {
             if !self.is_admin_peer(info) {
@@ -1159,6 +1181,23 @@ impl SyncedRouteInfo {
         all_trusted: &HashMap<Vec<u8>, TrustedCredentialPubkey>,
     ) {
         let _group_trust_lock = self.group_trust_update_lock.lock();
+        if self.context.flags().managed_peer_auth_required {
+            for (peer_id, info) in peer_infos.iter() {
+                let groups = all_trusted
+                    .get(&info.noise_static_pubkey)
+                    .map(|grant| {
+                        grant
+                            .groups
+                            .iter()
+                            .cloned()
+                            .map(|g| (g, Vec::new()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.set_peer_groups_locked(*peer_id, groups);
+            }
+            return;
+        }
         for (_, info) in peer_infos.iter() {
             if info.noise_static_pubkey.is_empty() {
                 continue;
@@ -1655,6 +1694,11 @@ impl SyncedRouteInfo {
         trust_admin_groups_without_proof: bool,
     ) {
         let _group_trust_lock = self.group_trust_update_lock.lock();
+        if self.context.flags().managed_peer_auth_required {
+            // Derived groups are replaced exclusively by the managed grants
+            // refresh, never by group proofs advertised by a peer.
+            return;
+        }
         let local_group_declarations = local_group_declarations
             .iter()
             .map(|g| (g.group_name.as_str(), g.group_secret.as_str()))
@@ -1834,6 +1878,13 @@ impl SyncedRouteInfo {
 
         let mut untrusted_peers =
             Self::collect_revoked_credential_peers(&peer_infos, &prev_trusted, &all_trusted);
+        if self.context.flags().managed_peer_auth_required {
+            untrusted_peers.extend(peer_infos.iter().filter_map(|(id, info)| {
+                (info.version > 0 && !all_trusted.contains_key(&info.noise_static_pubkey))
+                    .then_some(*id)
+            }));
+        }
+
         if let Some(protected_peer_id) = protected_peer_id {
             untrusted_peers.remove(&protected_peer_id);
         }
@@ -1872,6 +1923,9 @@ impl SyncedRouteInfo {
     fn get_credential_info_by_pubkey(&self, peer_pubkey: &[u8]) -> Option<TrustedCredentialPubkey> {
         if peer_pubkey.is_empty() {
             return None;
+        }
+        if let Some(grants) = self.context.managed_credential_grants() {
+            return grants.into_iter().find(|grant| grant.pubkey == peer_pubkey);
         }
         self.trusted_credential_pubkeys
             .read()
@@ -2426,6 +2480,7 @@ impl PeerRouteServiceImpl {
             foreign_network_my_peer_id_map: DashMap::new(),
 
             synced_route_info: SyncedRouteInfo {
+                context: context.clone(),
                 default_easytier_version: context.easytier_version(),
                 peer_infos: RwLock::new(OrderedHashMap::new()),
                 raw_peer_infos: DashMap::new(),
@@ -2543,7 +2598,7 @@ impl PeerRouteServiceImpl {
         let mut public_keys = BTreeMap::new();
         for peer_id in peers.iter().copied() {
             identity_types.insert(peer_id, interface.get_peer_identity_type(peer_id).await);
-            if self.peer_relay_projection_enabled() {
+            if self.peer_relay_projection_enabled() || self.context.flags().managed_peer_auth_required {
                 public_keys.insert(peer_id, interface.get_peer_public_key(peer_id).await);
             }
         }
@@ -3901,7 +3956,19 @@ impl RouteSessionManager {
                     .copied()
                     .flatten()
                     .unwrap_or(PeerIdentityType::Admin);
-                if matches!(identity_type, PeerIdentityType::Credential) {
+                if service_impl.context.flags().managed_peer_auth_required {
+                    // Rootless managed peers synchronize with each other only
+                    // after real direct Noise authentication and current grant
+                    // verification, not by their claimed route identity type.
+                    if !interface_snapshot
+                        .public_keys
+                        .get(&peer_id)
+                        .and_then(|key| key.as_ref())
+                        .is_some_and(|key| service_impl.context.is_managed_pubkey_authorized(key))
+                    {
+                        continue;
+                    }
+                } else if matches!(identity_type, PeerIdentityType::Credential) {
                     continue;
                 }
 
@@ -4079,7 +4146,10 @@ impl RouteSessionManager {
             .get_peer_identity_type_from_interface(from_peer_id)
             .await
             .unwrap_or(PeerIdentityType::Admin);
-        let from_is_credential = matches!(from_identity_type, PeerIdentityType::Credential);
+        let managed = service_impl.context.flags().managed_peer_auth_required;
+        // A root-secret identity cannot bypass authority scopes in managed mode.
+        let from_is_credential =
+            managed || matches!(from_identity_type, PeerIdentityType::Credential);
         let credential_info = if from_is_credential {
             service_impl
                 .get_peer_public_key_from_interface(from_peer_id)
@@ -4120,7 +4190,44 @@ impl RouteSessionManager {
 
         if let Some(peer_infos) = &peer_infos {
             // Step 9b: credential peers can only propagate their own route info
-            let (pi, rpi) = if from_is_credential {
+            let sanitized;
+            let sanitized_raw;
+            let (pi, rpi) = if managed {
+                let grants = service_impl
+                    .context
+                    .managed_credential_grants()
+                    .unwrap_or_default();
+                let source = credential_info.as_ref().unwrap();
+                let mut infos = Vec::new();
+                let mut raws = Vec::new();
+                let mut seen = HashSet::new();
+                for (info, raw) in peer_infos.iter().zip(raw_peer_infos.as_ref().unwrap()) {
+                    if info.peer_id == my_peer_id
+                        || (!source.allow_relay && info.peer_id != from_peer_id)
+                        || !seen.insert(info.peer_id)
+                        || (info.peer_id == from_peer_id
+                            && info.noise_static_pubkey != source.pubkey)
+                    {
+                        continue;
+                    }
+                    let Some(grant) = grants.iter().find(|g| g.pubkey == info.noise_static_pubkey)
+                    else {
+                        continue;
+                    };
+                    if let Some((info, raw)) = self.extract_credential_peer_info(
+                        info.peer_id,
+                        std::slice::from_ref(info),
+                        std::slice::from_ref(raw),
+                        grant,
+                    ) {
+                        infos.push(info);
+                        raws.push(raw);
+                    }
+                }
+                sanitized = infos;
+                sanitized_raw = raws;
+                (&sanitized, &sanitized_raw)
+            } else if from_is_credential {
                 if let Some(ret) = self.extract_credential_peer_info(
                     from_peer_id,
                     peer_infos,
@@ -4162,7 +4269,7 @@ impl RouteSessionManager {
         // Step 9b: credential peers' conn_info depends on allow_relay flag
         if let Some(conn_info) = &conn_info {
             let accept_conn_info =
-                !from_is_credential || credential_info.map(|tc| tc.allow_relay).unwrap_or(false);
+                !from_is_credential || credential_info.as_ref().is_some_and(|tc| tc.allow_relay);
             if accept_conn_info {
                 service_impl.synced_route_info.update_conn_info(conn_info);
                 session.update_dst_saved_conn_info_version(conn_info, from_peer_id);
@@ -4212,7 +4319,8 @@ impl RouteSessionManager {
         let (missing_peer_ids, missing_conn_peer_ids) = service_impl.collect_missing_peer_ids(
             &session,
             accepted_conn_info,
-            from_is_credential,
+            from_is_credential
+                && !(managed && credential_info.as_ref().is_some_and(|tc| tc.allow_relay)),
             &untrusted_peers,
         );
 
@@ -4313,6 +4421,7 @@ impl PublicIpv6SyncTrigger for OspfPublicIpv6SyncTrigger {
 }
 
 pub struct PeerRoute {
+    managed_session_store: RwLock<Option<Arc<PeerSessionStore>>>,
     my_peer_id: PeerId,
     context: ArcPeerContext,
     peer_rpc: Weak<PeerRpcManager>,
@@ -4322,6 +4431,42 @@ pub struct PeerRoute {
     session_mgr: RouteSessionManager,
 
     tasks: std::sync::Mutex<JoinSet<()>>,
+}
+
+impl PeerRoute {
+    /// Bind ACL identity to the actual direct/end-to-end Noise session, never
+    /// to an unsigned peer-ID/public-key tuple advertised by an approved relay.
+    pub(crate) fn install_managed_session_store(&self, store: Arc<PeerSessionStore>) {
+        *self.managed_session_store.write() = Some(store);
+    }
+
+    fn managed_authenticated_groups(&self, peer_id: PeerId) -> Arc<Vec<String>> {
+        let key = if peer_id == self.my_peer_id {
+            self.context
+                .secure_mode()
+                .and_then(|mode| mode.public_key().ok())
+                .map(|key| key.as_bytes().to_vec())
+        } else {
+            self.managed_session_store
+                .read()
+                .as_ref()
+                .and_then(|store| store.get(&SessionKey::new(self.context.network_name(), peer_id)))
+                .and_then(|session| session.peer_static_pubkey())
+                .map(|key| key.to_vec())
+        };
+        let Some(key) = key else {
+            return Arc::new(Vec::new());
+        };
+        Arc::new(
+            self.context
+                .managed_credential_grants()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|grant| grant.pubkey == key)
+                .map(|grant| grant.groups)
+                .unwrap_or_default(),
+        )
+    }
 }
 
 impl Debug for PeerRoute {
@@ -4413,6 +4558,7 @@ impl PeerRoute {
         service_impl.set_public_ipv6_service(Arc::downgrade(&public_ipv6_service));
 
         Arc::new(PeerRoute {
+            managed_session_store: RwLock::new(None),
             my_peer_id,
             context,
             peer_rpc: Arc::downgrade(&peer_rpc),
@@ -4812,6 +4958,9 @@ impl Route for PeerRoute {
     }
 
     fn get_peer_groups(&self, peer_id: PeerId) -> Arc<Vec<String>> {
+        if self.context.flags().managed_peer_auth_required {
+            return self.managed_authenticated_groups(peer_id);
+        }
         self.service_impl.get_peer_groups(peer_id)
     }
 
@@ -4909,6 +5058,180 @@ mod tests {
         fn my_peer_id(&self) -> PeerId {
             1
         }
+    }
+
+    #[derive(Default)]
+    struct ManagedAuthorityContext {
+        grants: RwLock<Vec<TrustedCredentialPubkey>>,
+    }
+
+    impl PeerContext for ManagedAuthorityContext {
+        fn network_identity(&self) -> CoreNetworkIdentity {
+            CoreNetworkIdentity::default()
+        }
+        fn flags(&self) -> crate::proto::common::FlagsInConfig {
+            crate::proto::common::FlagsInConfig {
+                managed_peer_auth_required: true,
+                ..Default::default()
+            }
+        }
+        fn managed_credential_grants(&self) -> Option<Vec<TrustedCredentialPubkey>> {
+            Some(self.grants.read().clone())
+        }
+    }
+
+    #[test]
+    fn managed_ospf_trust_uses_only_current_authority_grants_without_admin_root() {
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let context = Arc::new(ManagedAuthorityContext::default());
+        *context.grants.write() = vec![
+            TrustedCredentialPubkey {
+                pubkey: vec![7; 32],
+                groups: vec!["members".into()],
+                allow_relay: true,
+                expiry_unix: now + 120,
+                reusable: Some(false),
+                ..Default::default()
+            },
+            TrustedCredentialPubkey {
+                pubkey: vec![8; 32],
+                expiry_unix: now - 1,
+                ..Default::default()
+            },
+        ];
+        let service = PeerRouteServiceImpl::new(1, context.clone());
+        let info = &service.synced_route_info;
+        info.peer_infos.write().insert(
+            2,
+            RoutePeerInfo {
+                peer_id: 2,
+                version: 1,
+                noise_static_pubkey: vec![7; 32],
+                groups: vec![PeerGroupInfo {
+                    group_name: "admin-spoof".into(),
+                    group_proof: vec![1],
+                }],
+                ..Default::default()
+            },
+        );
+        // A peer claiming Admin identity and a root proof cannot expand the
+        // local signed directory, even if it knows an old network root secret.
+        info.peer_infos.write().insert(
+            3,
+            RoutePeerInfo {
+                peer_id: 3,
+                version: 1,
+                noise_static_pubkey: vec![9; 32],
+                trusted_credential_pubkeys: vec![TrustedCredentialPubkeyProof::new_signed(
+                    TrustedCredentialPubkey {
+                        pubkey: vec![9; 32],
+                        expiry_unix: now + 120,
+                        groups: vec!["admin-spoof".into()],
+                        ..Default::default()
+                    },
+                    "old-root",
+                )],
+                ..Default::default()
+            },
+        );
+        let (grants, keys) =
+            info.collect_trusted_credentials(&info.peer_infos.read(), Some("old-root"), now);
+        assert_eq!(grants.len(), 1);
+        assert_eq!(keys.len(), 1);
+        assert!(grants.get(&vec![7; 32]).unwrap().allow_relay);
+        info.verify_and_update_group_trusts(
+            &info.peer_infos.read().values().cloned().collect::<Vec<_>>(),
+            &[],
+            true,
+        );
+        info.update_credential_groups(&info.peer_infos.read(), &grants);
+        assert_eq!(
+            info.group_trust_map_cache.get(&2).unwrap().as_slice(),
+            &["members".to_string()]
+        );
+        assert!(!info.group_trust_map_cache.contains_key(&3));
+        let (removed, _) = info.verify_and_update_credential_trusts(None);
+        assert!(removed.contains(&3));
+        assert!(!removed.contains(&2));
+        // Removing a grant withdraws both its route and derived group. Another
+        // node's announcements cannot renew a revoked/expired authority grant.
+        context.grants.write().clear();
+        let (removed, _) = info.verify_and_update_credential_trusts(None);
+        assert!(removed.contains(&2));
+        assert!(!info.group_trust_map_cache.contains_key(&2));
+        assert!(info.get_credential_info_by_pubkey(&[7; 32]).is_none());
+    }
+
+    #[tokio::test]
+    async fn managed_ospf_relabel_cannot_change_authenticated_acl_groups() {
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let context = Arc::new(ManagedAuthorityContext::default());
+        *context.grants.write() = vec![
+            TrustedCredentialPubkey {
+                pubkey: vec![7; 32],
+                groups: vec!["guest".into()],
+                expiry_unix: now + 120,
+                ..Default::default()
+            },
+            TrustedCredentialPubkey {
+                pubkey: vec![9; 32],
+                groups: vec!["admin".into()],
+                expiry_unix: now + 120,
+                ..Default::default()
+            },
+        ];
+        let peer_rpc = Arc::new(PeerRpcManager::new(TestPeerRpcTransport));
+        let route = PeerRoute::new(
+            1,
+            context.clone(),
+            Arc::new(TestPublicIpv6Runtime),
+            peer_rpc,
+        );
+        let store = Arc::new(PeerSessionStore::new());
+        store
+            .upsert_responder_session(
+                &SessionKey::new(context.network_name(), 2),
+                None,
+                "aes-gcm".into(),
+                "aes-gcm".into(),
+                Some([7; 32]),
+            )
+            .unwrap();
+        route.install_managed_session_store(store.clone());
+        route
+            .service_impl
+            .synced_route_info
+            .peer_infos
+            .write()
+            .insert(
+                2,
+                RoutePeerInfo {
+                    peer_id: 2,
+                    version: 100,
+                    noise_static_pubkey: vec![9; 32],
+                    ..Default::default()
+                },
+            );
+        route
+            .service_impl
+            .synced_route_info
+            .group_trust_map_cache
+            .insert(2, Arc::new(vec!["admin".into()]));
+        assert_eq!(route.get_peer_groups(2).as_slice(), &["guest".to_string()]);
+        assert!(route.get_peer_groups(3).is_empty()); // only route claims, no actual session
+        context
+            .grants
+            .write()
+            .retain(|grant| grant.pubkey != vec![7; 32]);
+        assert!(route.get_peer_groups(2).is_empty()); // fresh signed revocation wins immediately
+        store.remove(&SessionKey::new(context.network_name(), 2));
+        assert!(route.get_peer_groups(2).is_empty());
     }
 
     struct TestPeerRpcTransport;

@@ -93,6 +93,29 @@ struct Cli {
     )]
     config_server: Option<String>,
 
+    /// Native managed enrollment state; enables verified HTTPS authorization.
+    #[arg(long, env = "ET_MANAGED_STATE")]
+    managed_state: Option<PathBuf>,
+    #[arg(long, default_value = crate::managed::DEFAULT_ORIGIN, env = "ET_MANAGED_ORIGIN")]
+    managed_origin: String,
+    /// Import an existing local instance UUID/overlay key without replacing identity.
+    #[arg(long, requires = "managed_state")]
+    managed_import_config: Option<PathBuf>,
+    /// Initialize local identity and print public identity JSON only; no network/TUN.
+    #[arg(long, requires = "managed_state")]
+    managed_status: bool,
+    /// Explicit local intent to become a center-approved root-secret-free relay.
+    #[arg(long, requires = "managed_state")]
+    managed_relay: bool,
+    #[arg(long = "managed-advertise", requires = "managed_relay")]
+    managed_advertise: Vec<String>,
+    #[arg(long = "managed-listen", requires = "managed_relay")]
+    managed_listen: Vec<String>,
+    #[arg(long, default_value = "unspecified", requires = "managed_relay")]
+    managed_region: String,
+    #[arg(long, requires = "managed_relay")]
+    managed_relay_invitation_file: Option<PathBuf>,
+
     #[arg(
         long,
         env = "ET_MACHINE_ID",
@@ -1517,18 +1540,68 @@ fn win_service_main(arg: Vec<std::ffi::OsString>) {
     win_service_event_loop(stop_notify_recv, cli, status_handle);
 }
 
+async fn start_cli_rpc(
+    managed: bool,
+    portal: Option<String>,
+    whitelist: Option<Vec<IpCidr>>,
+    manager: Arc<crate::instance::factory::NativeInstanceManager>,
+) -> anyhow::Result<Option<ApiRpcServer<crate::proto::rpc::standalone::RuntimeRpcListener>>> {
+    if managed {
+        return Ok(None);
+    }
+    Ok(Some(
+        ApiRpcServer::new(portal, whitelist, manager)?
+            .serve()
+            .await?,
+    ))
+}
+
 async fn run_main(cli: Cli) -> anyhow::Result<()> {
     defer!(dump_profile(0););
     log::init(&cli.logging_options, true)?;
+    let managed_options =
+        cli.managed_state
+            .as_ref()
+            .map(|state_dir| crate::managed::ManagedOptions {
+                state_dir: state_dir.clone(),
+                origin: cli.managed_origin.clone(),
+                import_config: cli.managed_import_config.clone(),
+                relay: cli
+                    .managed_relay
+                    .then(|| crate::managed::RelayAdvertisement {
+                        listeners: cli.managed_listen.clone(),
+                        public_peers: cli.managed_advertise.clone(),
+                        region: cli.managed_region.clone(),
+                    }),
+                relay_invitation_file: cli.managed_relay_invitation_file.clone(),
+            });
+    if let Some(options) = &managed_options {
+        anyhow::ensure!(
+            cli.config_server.is_none()
+                && cli.config_file.is_none()
+                && cli.config_dir.is_none()
+                && cli.network_options.network_name.is_none(),
+            "managed mode cannot combine with unmanaged configuration sources"
+        );
+        if cli.managed_status {
+            println!(
+                "{}",
+                serde_json::to_string(&crate::managed::status(options)?)?
+            );
+            return Ok(());
+        }
+    }
 
     let manager = Arc::new(native_cli_instance_manager().with_config_path(cli.config_dir.clone()));
 
-    let _rpc_server = ApiRpcServer::new(
+    // The legacy RPC protocol has no per-user authorization and can return full
+    // private configuration. Managed mode exposes no TCP RPC server at all.
+    let _rpc_server = start_cli_rpc(
+        managed_options.is_some(),
         cli.rpc_portal_options.rpc_portal,
         cli.rpc_portal_options.rpc_portal_whitelist,
         manager.clone(),
-    )?
-    .serve()
+    )
     .await?;
 
     let _web_client = if let Some(config_server_url_s) = cli.config_server.as_ref() {
@@ -1558,7 +1631,7 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
         None
     };
 
-    let _daemon_guard = if cli.daemon {
+    let _daemon_guard = if cli.daemon || managed_options.is_some() {
         Some(manager.register_daemon())
     } else {
         None
@@ -1597,7 +1670,7 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
     }
     let config_file_count = config_files.len();
     let mut crate_cli_network = {
-        if cli.daemon {
+        if cli.daemon || managed_options.is_some() {
             false
         } else if config_file_count == 0 && cli.config_server.is_none() {
             true
@@ -1658,6 +1731,10 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
         manager.run_network_instance(cfg, ConfigFileControl::STATIC_CONFIG)?;
     }
 
+    let managed_runtime = managed_options
+        .map(|options| crate::managed::ManagedRuntime::start(options, manager.clone()))
+        .transpose()?;
+
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     #[cfg(unix)]
@@ -1681,6 +1758,9 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
         _ = sigterm, if cfg!(unix) => {
             log::warn!("terminate signal received, exiting...");
         }
+    }
+    if let Some(runtime) = managed_runtime {
+        runtime.shutdown().await?;
     }
     Ok(())
 }
@@ -1827,6 +1907,31 @@ async fn validate_config(cli: &Cli) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn managed_cli_plain_client_and_explicit_relay_parse_independently() {
+        let plain = Cli::try_parse_from(["easytier-core", "--managed-state", "/tmp/itachi-cli-fixture", "--managed-status"]).unwrap();
+        assert!(!plain.managed_relay);
+        assert!(plain.managed_advertise.is_empty());
+        let relay = Cli::try_parse_from(["easytier-core", "--managed-state", "/tmp/itachi-cli-fixture", "--managed-status", "--managed-relay", "--managed-listen", "tcp://0.0.0.0:57220", "--managed-advertise", "tcp://1.1.1.1:57220"]).unwrap();
+        assert!(relay.managed_relay);
+        assert_eq!(relay.managed_region, "unspecified");
+        assert!(Cli::try_parse_from(["easytier-core", "--managed-state", "/tmp/itachi-cli-fixture", "--managed-advertise", "tcp://1.1.1.1:57220"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn managed_cli_never_opens_legacy_rpc_socket() {
+        let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = reservation.local_addr().unwrap();
+        drop(reservation);
+        let manager = std::sync::Arc::new(crate::instance::factory::native_instance_manager());
+        let server = super::start_cli_rpc(true, Some(address.to_string()), None, manager)
+            .await
+            .unwrap();
+        assert!(server.is_none());
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
+        let _proof_of_unbound = tokio::net::TcpListener::bind(address).await.unwrap();
+    }
+
     use super::*;
 
     #[test]

@@ -57,6 +57,7 @@ pub(crate) fn managed_credential_from_proto(
     ManagedCredentialConfig {
         credential_id: credential.credential_id.clone(),
         credential_secret: credential.credential_secret.clone(),
+        credential_public_key: credential.credential_public_key.clone(),
         groups: credential.groups.clone(),
         allow_relay: credential.allow_relay,
         allowed_proxy_cidrs: credential.allowed_proxy_cidrs.clone(),
@@ -71,6 +72,7 @@ pub(crate) fn managed_credential_to_proto(
     manage::ManagedCredentialConfig {
         credential_id: credential.credential_id,
         credential_secret: credential.credential_secret,
+        credential_public_key: credential.credential_public_key,
         groups: credential.groups,
         allow_relay: credential.allow_relay,
         allowed_proxy_cidrs: credential.allowed_proxy_cidrs,
@@ -908,6 +910,7 @@ mod tests {
             managed_credentials: vec![manage::ManagedCredentialConfig {
                 credential_id: "managed-a".to_owned(),
                 credential_secret: "secret".to_owned(),
+                credential_public_key: None,
                 groups: vec!["ops".to_owned()],
                 allow_relay: true,
                 allowed_proxy_cidrs: vec!["10.0.0.0/24".to_owned()],

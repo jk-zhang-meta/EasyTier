@@ -116,6 +116,8 @@ message ManagedCredentialConfig {
   repeated string allowed_proxy_cidrs = 5;
   int64 expiry_unix = 6;
   optional bool reusable = 7;
+  // Exactly one of this public identity or credential_secret must be present.
+  optional string credential_public_key = 8;
 }
 
 message ManagedCredentialSet {

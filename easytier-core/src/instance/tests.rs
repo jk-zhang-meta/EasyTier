@@ -778,6 +778,7 @@ network_secret = "network-secret"
                         entries: vec![ManagedCredentialConfig {
                             credential_id: "pathless".to_owned(),
                             credential_secret: secret.clone(),
+                            credential_public_key: None,
                             expiry_unix: i64::MAX,
                             ..Default::default()
                         }],
@@ -803,6 +804,7 @@ network_secret = "network-secret"
             vec![ManagedCredentialConfig {
                 credential_id: "pathless".to_owned(),
                 credential_secret: secret,
+                credential_public_key: None,
                 expiry_unix: i64::MAX,
                 reusable: Some(true),
                 ..Default::default()
@@ -864,6 +866,7 @@ source = "web"
                 entries: vec![ManagedCredentialConfig {
                     credential_id: "managed".to_owned(),
                     credential_secret: secret.clone(),
+                    credential_public_key: None,
                     groups: vec!["ops".to_owned()],
                     allow_relay: false,
                     allowed_proxy_cidrs: Vec::new(),

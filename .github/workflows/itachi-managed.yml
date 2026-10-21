@@ -1,0 +1,111 @@
+name: Itachi managed native clients
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  clients:
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            platform: linux
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            platform: linux
+            arch: aarch64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: macos
+            arch: x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            platform: macos
+            arch: aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows
+            arch: x86_64
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            platform: windows
+            arch: aarch64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - name: Portable Linux toolchain
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y musl-tools
+          mkdir -p .cargo
+          printf '[target.${{ matrix.target }}]\nlinker = "musl-gcc"\n' > .cargo/config.toml
+          target='${{ matrix.target }}'
+          echo "CC_${target//-/_}=musl-gcc" >> "$GITHUB_ENV"
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: '1.99.0'
+          target: ${{ matrix.target }}
+          cache: false
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: '35.1'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Focused managed runtime tests
+        if: matrix.platform == 'linux' && matrix.arch == 'x86_64'
+        run: cargo test -j 2 -p easytier --lib --no-default-features --features management,tun,ring-crypto,cli,icmp-proxy,websocket,smoltcp managed::tests
+      - name: Focused native peer admission and packet security tests
+        if: matrix.platform == 'linux' && matrix.arch == 'x86_64'
+        shell: bash
+        run: |
+          cargo test -j 2 -p easytier-core --lib managed
+          cargo test -j 2 -p easytier-core --lib secure_datagram::tests
+          cargo test -j 2 -p easytier-core --lib service_flows
+          cargo test -j 2 -p easytier-core --lib peers::acl::filter::tests
+          cargo test -j 2 -p easytier --lib --no-default-features --features management,tun,ring-crypto,cli,icmp-proxy,websocket,smoltcp managed_cli
+      - name: Build exact native source
+        run: cargo build --release -j 2 --target ${{ matrix.target }} -p easytier --bins --no-default-features --features management,tun,ring-crypto,cli,icmp-proxy,websocket,smoltcp
+      - name: Package clients and native installers
+        run: python script/itachi/package.py --target ${{ matrix.target }} --platform ${{ matrix.platform }} --arch ${{ matrix.arch }} --output dist-itachi
+      - name: Verify Unix startup, idempotence and fresh-install rollback
+        if: matrix.platform != 'windows'
+        shell: bash
+        run: |
+          python -m zipfile -e dist-itachi/easytier-itachi-${{ matrix.platform }}-${{ matrix.arch }}.zip smoke-client
+          sudo bash smoke-client/install.sh
+          sudo bash smoke-client/install.sh
+          if [[ '${{ matrix.platform }}' == linux ]]; then
+            systemctl is-enabled easytier-itachi.service
+            systemctl is-active easytier-itachi.service
+          else
+            sudo launchctl print system/fans.itachi.easytier
+          fi
+          sudo bash smoke-client/rollback.sh
+          if [[ '${{ matrix.platform }}' == linux ]]; then
+            test ! -e /etc/systemd/system/easytier-itachi.service
+          else
+            test ! -e /Library/LaunchDaemons/fans.itachi.easytier.plist
+          fi
+      - name: Verify Windows startup, idempotence and fresh-install rollback
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          Expand-Archive -LiteralPath dist-itachi/easytier-itachi-windows-${{ matrix.arch }}.zip -DestinationPath smoke-client
+          & ./smoke-client/install.ps1
+          & ./smoke-client/install.ps1
+          $service = Get-Service EasyTierItachi
+          if ($service.Status -ne 'Running' -or $service.StartType -ne 'Automatic') { throw 'Startup service verification failed' }
+          & ./smoke-client/rollback.ps1
+          if (Get-Service EasyTierItachi -ErrorAction SilentlyContinue) { throw 'Fresh-install rollback left a service' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: easytier-itachi-${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist-itachi/*
+          if-no-files-found: error
+          retention-days: 14

@@ -713,6 +713,17 @@ impl SecureDatagramSession {
         if !self.is_valid() {
             return Err(anyhow!("session invalidated"));
         }
+        // Generic encryptors deliberately accept unencrypted packets in legacy
+        // pipelines. A secure Noise/datagram session must never inherit that
+        // no-op behavior: encrypted framing is a prerequisite for AEAD proof.
+        if !ciphertext_with_tail
+            .peer_manager_header()
+            .is_some_and(|header| header.is_encrypted())
+        {
+            return Err(anyhow!(
+                "secure session requires authenticated encrypted framing"
+            ));
+        }
         let nonce_bytes =
             Self::parse_tail(ciphertext_with_tail.payload()).ok_or_else(|| anyhow!("no tail"))?;
         let epoch = u32::from_be_bytes(nonce_bytes[..4].try_into().unwrap());
@@ -856,6 +867,38 @@ mod tests {
 
         assert!(s.check_replay_for_test(1, 1, SecureDatagramDirection::AToB, now + 1));
         assert!(s.check_replay_for_test(1, 2, SecureDatagramDirection::AToB, now + 2));
+    }
+
+    #[test]
+    #[cfg(any(
+        feature = "aes-gcm",
+        feature = "openssl-crypto",
+        feature = "ring-crypto"
+    ))]
+    fn plaintext_with_valid_nonce_tail_cannot_bypass_secure_session_aead() {
+        use crate::packet::PacketType;
+        let key = SecureDatagramSession::new_root_key();
+        let sender =
+            SecureDatagramSession::new(key, 1, 0, "aes-256-gcm".into(), "aes-256-gcm".into());
+        let receiver =
+            SecureDatagramSession::new(key, 1, 0, "aes-256-gcm".into(), "aes-256-gcm".into());
+        let mut encrypted = ZCPacket::new_with_payload(b"authenticated real packet");
+        encrypted.fill_peer_manager_hdr(10, 20, PacketType::Data as u8);
+        sender
+            .encrypt_payload(SecureDatagramDirection::AToB, &mut encrypted)
+            .unwrap();
+        let mut fake = ZCPacket::new_with_payload(encrypted.payload());
+        fake.fill_peer_manager_hdr(10, 20, PacketType::Data as u8);
+        assert!(!fake.peer_manager_header().unwrap().is_encrypted());
+        assert!(
+            receiver
+                .decrypt_payload(SecureDatagramDirection::AToB, &mut fake)
+                .is_err()
+        );
+        receiver
+            .decrypt_payload(SecureDatagramDirection::AToB, &mut encrypted)
+            .unwrap();
+        assert_eq!(encrypted.payload(), b"authenticated real packet");
     }
 
     #[test]

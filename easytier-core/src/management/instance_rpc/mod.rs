@@ -463,6 +463,19 @@ where
         })
     }
 
+    async fn list_service_flows(
+        &self,
+        _: BaseController,
+        request: easytier_proto::api::instance::ListServiceFlowsRequest,
+    ) -> rpc_types::error::Result<easytier_proto::api::instance::ListServiceFlowsResponse> {
+        let instance = self.instance(request.instance.as_ref())?;
+        let snapshot = instance
+            .peer_manager()
+            .service_flow_snapshot(request.limit as usize);
+        let snapshot_json = serde_json::to_string(&snapshot).map_err(anyhow::Error::from)?;
+        Ok(easytier_proto::api::instance::ListServiceFlowsResponse { snapshot_json })
+    }
+
     async fn list_public_ipv6_info(
         &self,
         _: BaseController,

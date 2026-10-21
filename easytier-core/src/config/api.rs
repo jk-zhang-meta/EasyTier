@@ -194,6 +194,7 @@ mod tests {
         config.set_managed_credentials(vec![ManagedCredentialConfig {
             credential_id: "managed-a".to_owned(),
             credential_secret: "credential-secret".to_owned(),
+            credential_public_key: None,
             groups: vec!["ops".to_owned()],
             allow_relay: true,
             allowed_proxy_cidrs: vec!["10.0.0.0/24".to_owned()],
@@ -208,6 +209,7 @@ mod tests {
             vec![manage::ManagedCredentialConfig {
                 credential_id: "managed-a".to_owned(),
                 credential_secret: "credential-secret".to_owned(),
+                credential_public_key: None,
                 groups: vec!["ops".to_owned()],
                 allow_relay: true,
                 allowed_proxy_cidrs: vec!["10.0.0.0/24".to_owned()],

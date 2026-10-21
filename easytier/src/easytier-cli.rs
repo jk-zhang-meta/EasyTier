@@ -194,6 +194,11 @@ struct PeerArgs {
 
 #[derive(Subcommand, Debug)]
 enum PeerSubCommand {
+    /// Show bounded endpoint TCP/UDP observations (not application login or a full route trace)
+    Flows {
+        #[arg(long, default_value_t = 64)]
+        limit: u32,
+    },
     /// List connected peers
     List,
     /// Show public IPv6 address information
@@ -3351,6 +3356,20 @@ async fn main() -> Result<(), Error> {
 
     match cli.sub_command {
         SubCommand::Peer(peer_args) => match &peer_args.sub_command {
+            Some(PeerSubCommand::Flows { limit }) => {
+                let response = handler
+                    .get_peer_manager_client()
+                    .await?
+                    .list_service_flows(
+                        BaseController::default(),
+                        easytier::proto::api::instance::ListServiceFlowsRequest {
+                            instance: Some(handler.instance_selector.clone()),
+                            limit: (*limit).min(256),
+                        },
+                    )
+                    .await?;
+                println!("{}", response.snapshot_json);
+            }
             Some(PeerSubCommand::List) => {
                 handler.handle_peer_list().await?;
             }

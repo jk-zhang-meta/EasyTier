@@ -14,6 +14,8 @@ pub mod common;
 pub mod core;
 #[cfg(feature = "upnp")]
 pub(crate) mod igd_next;
+#[cfg(feature = "management")]
+pub mod managed;
 pub mod proto;
 #[cfg(feature = "management-rpc")]
 pub mod rpc_service;

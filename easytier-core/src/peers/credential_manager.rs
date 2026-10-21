@@ -144,12 +144,41 @@ impl CredentialEntry {
 
     fn from_managed(entry: &ManagedCredentialConfig) -> Result<Self, String> {
         let credential_id = entry.credential_id.trim();
-        let private_bytes: [u8; 32] = BASE64_STANDARD
-            .decode(entry.credential_secret.trim())
-            .map_err(|_| format!("credential_secret for {credential_id} must be base64"))?
-            .try_into()
-            .map_err(|_| format!("credential_secret for {credential_id} must contain 32 bytes"))?;
-        let private = StaticSecret::from(private_bytes);
+        let supplied_public = entry.credential_public_key.as_deref().map(str::trim);
+        let supplied_secret = entry.credential_secret.trim();
+        if supplied_secret.is_empty() == supplied_public.is_none_or(str::is_empty) {
+            return Err(format!(
+                "credential {credential_id} requires exactly one private or public key"
+            ));
+        }
+        let (pubkey, secret) = if let Some(public) = supplied_public.filter(|v| !v.is_empty()) {
+            let bytes: [u8; 32] = BASE64_STANDARD
+                .decode(public)
+                .map_err(|_| format!("credential_public_key for {credential_id} must be base64"))?
+                .try_into()
+                .map_err(|_| {
+                    format!("credential_public_key for {credential_id} must contain 32 bytes")
+                })?;
+            if bytes == [0; 32] {
+                return Err(format!(
+                    "credential_public_key for {credential_id} must not be zero"
+                ));
+            }
+            (BASE64_STANDARD.encode(bytes), String::new())
+        } else {
+            let bytes: [u8; 32] = BASE64_STANDARD
+                .decode(supplied_secret)
+                .map_err(|_| format!("credential_secret for {credential_id} must be base64"))?
+                .try_into()
+                .map_err(|_| {
+                    format!("credential_secret for {credential_id} must contain 32 bytes")
+                })?;
+            let private = StaticSecret::from(bytes);
+            (
+                BASE64_STANDARD.encode(PublicKey::from(&private).as_bytes()),
+                BASE64_STANDARD.encode(private.as_bytes()),
+            )
+        };
         let grant = CredentialGrant::new(
             entry.groups.clone(),
             entry.allow_relay,
@@ -163,8 +192,8 @@ impl CredentialEntry {
             )
         })?;
         Ok(Self {
-            pubkey: BASE64_STANDARD.encode(PublicKey::from(&private).as_bytes()),
-            secret: BASE64_STANDARD.encode(private.as_bytes()),
+            pubkey,
+            secret,
             grant,
             expiry_unix: entry.expiry_unix,
             created_at_unix: 0,
@@ -247,6 +276,7 @@ pub fn validate_managed_credential_set(
         .map(|credential| ManagedCredentialConfig {
             credential_id: credential.credential_id.clone(),
             credential_secret: credential.credential_secret.clone(),
+            credential_public_key: credential.credential_public_key.clone(),
             groups: credential.groups.clone(),
             allow_relay: credential.allow_relay,
             allowed_proxy_cidrs: credential.allowed_proxy_cidrs.clone(),
@@ -580,6 +610,33 @@ impl CredentialManager {
         trusted
     }
 
+    /// Exact authority snapshot only: legacy file/base grants and attached
+    /// ephemeral credentials cannot authorize managed admission or relay use.
+    pub fn is_managed_pubkey_authorized(&self, pubkey: &[u8]) -> bool {
+        if pubkey.len() != 32 {
+            return false;
+        }
+        let encoded = BASE64_STANDARD.encode(pubkey);
+        let now = current_unix_timestamp();
+        self.state.lock().unwrap().managed.values().any(|entry| {
+            entry.secret.is_empty() && entry.pubkey == encoded && entry.is_active_at(now)
+        })
+    }
+
+    /// Authority-committed public grants only; never import propagated, legacy,
+    /// ephemeral or pending credentials into managed routing policy.
+    pub fn managed_credential_grants(&self) -> Vec<TrustedCredentialPubkey> {
+        let now = current_unix_timestamp();
+        self.state
+            .lock()
+            .unwrap()
+            .managed
+            .values()
+            .filter(|entry| entry.secret.is_empty() && entry.is_active_at(now))
+            .filter_map(CredentialEntry::to_trusted_credential)
+            .collect()
+    }
+
     pub fn is_pubkey_trusted(&self, pubkey: &[u8]) -> bool {
         let now = current_unix_timestamp();
         let encoded = BASE64_STANDARD.encode(pubkey);
@@ -776,12 +833,86 @@ mod tests {
         ManagedCredentialConfig {
             credential_id: credential_id.to_owned(),
             credential_secret: BASE64_STANDARD.encode([secret_byte; 32]),
+            credential_public_key: None,
             groups: vec!["ops".to_owned()],
             allow_relay: false,
             allowed_proxy_cidrs: vec!["10.0.0.0/24".to_owned()],
             expiry_unix,
             reusable: true,
         }
+    }
+
+    #[test]
+    fn public_only_managed_credentials_do_not_retain_private_keys() {
+        let mut credential = managed_credential("managed-public", 9, i64::MAX);
+        let public = PublicKey::from(&StaticSecret::from([9; 32]));
+        credential.credential_secret.clear();
+        credential.credential_public_key = Some(BASE64_STANDARD.encode(public.as_bytes()));
+        let entry = CredentialEntry::from_managed(&credential).unwrap();
+        assert!(entry.secret.is_empty());
+        assert_eq!(entry.pubkey, BASE64_STANDARD.encode(public.as_bytes()));
+        let manager = CredentialManager::new();
+        manager
+            .install_initial_managed_credentials(&[credential])
+            .unwrap();
+        assert!(manager.is_pubkey_trusted(public.as_bytes()));
+    }
+
+    #[test]
+    fn managed_authorization_excludes_legacy_base_and_ephemeral_grants() {
+        let manager = CredentialManager::new();
+        let legacy = manager.generate_credential(
+            vec!["legacy".into()],
+            false,
+            Vec::new(),
+            Duration::from_secs(120),
+        );
+        let secret: [u8; 32] = BASE64_STANDARD
+            .decode(legacy.secret)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let legacy_public = PublicKey::from(&StaticSecret::from(secret));
+        assert!(manager.is_pubkey_trusted(legacy_public.as_bytes()));
+        assert!(!manager.is_managed_pubkey_authorized(legacy_public.as_bytes()));
+        let ephemeral = PublicKey::from(&StaticSecret::from([21; 32]));
+        manager
+            .register_ephemeral_credential(*ephemeral.as_bytes(), vec!["attached".into()])
+            .unwrap();
+        assert!(manager.is_pubkey_trusted(ephemeral.as_bytes()));
+        assert!(!manager.is_managed_pubkey_authorized(ephemeral.as_bytes()));
+        let public = PublicKey::from(&StaticSecret::from([22; 32]));
+        let mut credential =
+            managed_credential("only-snapshot", 22, current_unix_timestamp() + 120);
+        credential.credential_secret.clear();
+        credential.credential_public_key = Some(BASE64_STANDARD.encode(public.as_bytes()));
+        manager
+            .install_initial_managed_credentials(&[credential.clone()])
+            .unwrap();
+        assert!(manager.is_managed_pubkey_authorized(public.as_bytes()));
+        let grants = manager.managed_credential_grants();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].pubkey, public.as_bytes());
+        credential.expiry_unix = current_unix_timestamp() - 1;
+        manager
+            .install_initial_managed_credentials(&[credential])
+            .unwrap();
+        assert!(!manager.is_managed_pubkey_authorized(public.as_bytes()));
+        assert!(manager.managed_credential_grants().is_empty());
+    }
+
+    #[test]
+    fn managed_key_inputs_are_exclusive_and_validated() {
+        let mut credential = managed_credential("managed-public", 9, i64::MAX);
+        credential.credential_public_key = Some(BASE64_STANDARD.encode([8; 32]));
+        assert!(CredentialEntry::from_managed(&credential).is_err());
+        credential.credential_secret.clear();
+        credential.credential_public_key = None;
+        assert!(CredentialEntry::from_managed(&credential).is_err());
+        credential.credential_public_key = Some("not-base64".to_owned());
+        assert!(CredentialEntry::from_managed(&credential).is_err());
+        credential.credential_public_key = Some(BASE64_STANDARD.encode([0; 32]));
+        assert!(CredentialEntry::from_managed(&credential).is_err());
     }
 
     #[test]
@@ -1334,6 +1465,7 @@ mod tests {
         let conflicting = ManagedCredentialConfig {
             credential_id: "other".to_owned(),
             credential_secret: generated.secret,
+            credential_public_key: None,
             ..managed_credential("other", 4, current_unix_timestamp() + 60)
         };
         let error = manager

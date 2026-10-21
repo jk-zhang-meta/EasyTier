@@ -71,6 +71,7 @@ pub fn gen_default_flags() -> Flags {
         disable_upnp: false,
         disable_relay_data: false,
         prefer_peer_relay: false,
+        managed_peer_auth_required: false,
         enable_udp_broadcast_relay: false,
         socket_mark: None,
     }
@@ -165,6 +166,7 @@ define_flags_diff! {
         disable_upnp,
         disable_relay_data,
         prefer_peer_relay,
+        managed_peer_auth_required,
         enable_udp_broadcast_relay,
         socket_mark,
     ],
@@ -490,7 +492,11 @@ fn default_true() -> bool {
 #[serde(deny_unknown_fields)]
 pub struct ManagedCredentialConfig {
     pub credential_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub credential_secret: String,
+    /// Public-only identity for managed proof-of-possession admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_public_key: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<String>,
     #[serde(default)]
@@ -508,6 +514,7 @@ impl std::fmt::Debug for ManagedCredentialConfig {
             .debug_struct("ManagedCredentialConfig")
             .field("credential_id", &self.credential_id)
             .field("credential_secret", &"<redacted>")
+            .field("credential_public_key", &self.credential_public_key)
             .field("groups", &self.groups)
             .field("allow_relay", &self.allow_relay)
             .field("allowed_proxy_cidrs", &self.allowed_proxy_cidrs)

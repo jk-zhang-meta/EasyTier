@@ -188,6 +188,10 @@ terminal_size = { version = "0.4", optional = true }
 unicode-width = { version = "0.2", optional = true }
 
 base64.workspace = true
+# Managed authorization uses verified HTTPS and a separate Ed25519 device identity.
+reqwest = { workspace = true, features = ["json", "rustls"], optional = true }
+ed25519-dalek = { version = "2.2.0", optional = true }
+x25519-dalek = { workspace = true, features = ["static_secrets"], optional = true }
 
 mimalloc = { workspace = true, optional = true }
 
@@ -243,6 +247,8 @@ windivert = { git = "https://github.com/EasyTier/windivert-rust.git", rev = "adc
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_NetworkManagement_WindowsFirewall",
@@ -429,6 +435,9 @@ extended-services = [
     "proxy-cidr-monitor",
 ]
 management = [
+    "dep:reqwest",
+    "dep:ed25519-dalek",
+    "dep:x25519-dalek",
     "dep:atomic-write-file",
     "web-client",
     "logging",

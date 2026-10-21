@@ -14,7 +14,7 @@ use dashmap::DashMap;
 use easytier_proto::{
     acl::Acl,
     common::{FlagsInConfig, PeerFeatureFlag, SecureModeConfig, StunInfo, TunnelInfo},
-    peer_rpc::{PeerGroupInfo, TrustedCredentialPubkeyProof},
+    peer_rpc::{PeerGroupInfo, TrustedCredentialPubkey, TrustedCredentialPubkeyProof},
 };
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
@@ -668,6 +668,15 @@ pub(crate) trait PeerContext: Send + Sync {
             .to_vec()
     }
 
+    /// None preserves upstream trust semantics. Some(empty) is managed deny-all.
+    fn managed_credential_grants(&self) -> Option<Vec<TrustedCredentialPubkey>> {
+        None
+    }
+
+    fn is_managed_pubkey_authorized(&self, _pubkey: &[u8]) -> bool {
+        false
+    }
+
     fn is_pubkey_trusted(&self, _pubkey: &[u8], _network_name: &str) -> bool {
         false
     }
@@ -927,6 +936,16 @@ impl PeerContext for CorePeerContext {
 
     fn acl_group_declarations(&self) -> Vec<PeerGroupIdentity> {
         self.snapshot().acl_group_declarations.clone()
+    }
+
+    fn managed_credential_grants(&self) -> Option<Vec<TrustedCredentialPubkey>> {
+        self.flags()
+            .managed_peer_auth_required
+            .then(|| self.credentials.managed_credential_grants())
+    }
+
+    fn is_managed_pubkey_authorized(&self, pubkey: &[u8]) -> bool {
+        self.credentials.is_managed_pubkey_authorized(pubkey)
     }
 
     fn is_pubkey_trusted(&self, pubkey: &[u8], network_name: &str) -> bool {

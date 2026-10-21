@@ -74,6 +74,7 @@ use super::{
         ArcRoute, DisabledRoute, ForeignNetworkRouteInfoMap, NextHopPolicy, Route, RouteInterface,
         peer_ospf_route::PeerRoute,
     },
+    service_flows::{FlowDirection, ServiceFlowCollector, ServiceFlowSnapshot},
     traffic_metrics::{
         InstanceLabelKind, LogicalTrafficMetrics, TrafficKind, TrafficMetricRecorder,
         route_peer_info_instance_id, traffic_kind,
@@ -770,6 +771,7 @@ pub struct PeerManagerCore {
     data_compress_algo: CompressorAlgo,
     exit_nodes: Arc<RwLock<Vec<IpAddr>>>,
     acl_filter: Arc<AclFilter>,
+    service_flows: Arc<ServiceFlowCollector>,
     context: Arc<CorePeerContext>,
     runtime_config: CoreRuntimeConfigStore,
     runtime_config_update: Mutex<()>,
@@ -961,6 +963,7 @@ impl PeerManagerCore {
     ) -> Self {
         let stats_manager = core_context.stats_manager();
         let acl_filter = Arc::new(AclFilter::new());
+        let service_flows = Arc::new(ServiceFlowCollector::new());
         let context: ArcPeerContext = core_context.clone();
         let (packet_send, packet_recv) = super::create_packet_recv_chan();
         let peers = Arc::new(PeerMap::new(
@@ -988,6 +991,10 @@ impl PeerManagerCore {
             public_ipv6_runtime,
             peer_rpc_mgr.clone(),
         );
+
+        if let Some(route) = route_algo_inst.ospf_route() {
+            route.install_managed_session_store(peer_session_store.clone());
+        }
 
         let foreign_network_manager = Arc::new(ForeignNetworkManager::new(
             foreign_rpc_registrar,
@@ -1114,6 +1121,7 @@ impl PeerManagerCore {
             recent_traffic.clone(),
             traffic_metrics.clone(),
             acl_filter.clone(),
+            service_flows.clone(),
             is_secure_mode_enabled,
             self_tx_counters.self_tx_packets.clone(),
             self_tx_counters.self_tx_bytes.clone(),
@@ -1143,6 +1151,7 @@ impl PeerManagerCore {
             data_compress_algo,
             exit_nodes,
             acl_filter,
+            service_flows,
             runtime_config: core_context.runtime_config_store(),
             runtime_config_update: Mutex::new(()),
             context: core_context,
@@ -1321,6 +1330,19 @@ impl PeerManagerCore {
 
     pub fn acl_stats(&self) -> crate::proto::acl::AclStats {
         self.acl_filter.get_stats()
+    }
+
+    /// Endpoint observations only; native link/route snapshots are separate evidence.
+    pub fn service_flow_snapshot(&self, limit: usize) -> ServiceFlowSnapshot {
+        self.service_flows.snapshot(limit)
+    }
+
+    pub fn service_flow_snapshot_since(
+        &self,
+        limit: usize,
+        after_sequence: u64,
+    ) -> ServiceFlowSnapshot {
+        self.service_flows.snapshot_since(limit, after_sequence)
     }
 
     pub fn acl_filter(&self) -> Arc<AclFilter> {
@@ -1821,6 +1843,7 @@ impl PeerManagerCore {
             self.encryptor.clone(),
             self.data_compress_algo,
             self.acl_filter.clone(),
+            self.service_flows.clone(),
             self.context.clone(),
             self.is_secure_mode_enabled,
             self.route.clone(),
@@ -1960,6 +1983,22 @@ impl PeerConnectionAdmission {
         }
     }
 
+    fn enforce_managed_admission(&self, peer: &PeerConn) -> Result<(), Error> {
+        if !self.context.flags().managed_peer_auth_required {
+            return Ok(());
+        }
+        let key = peer.get_conn_info().noise_remote_static_pubkey;
+        if peer.get_network_identity().network_name != self.context.network_identity().network_name
+            || key.len() != 32
+            || !self.context.is_managed_pubkey_authorized(&key)
+        {
+            return Err(Error::SecretKeyError(
+                "managed peer has no current exact public-key authorization".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn add_client_tunnel_with_peer_id_hint(
         &self,
         tunnel: Box<dyn Tunnel>,
@@ -1975,6 +2014,7 @@ impl PeerConnectionAdmission {
             origin,
         );
         peer.do_handshake_as_client().await?;
+        self.enforce_managed_admission(&peer)?;
         let conn_id = peer.get_conn_id();
         let peer_id = peer.get_peer_id();
         let local_identity = self.context.network_identity();
@@ -2069,6 +2109,7 @@ impl PeerConnectionAdmission {
             return Err(err);
         }
 
+        self.enforce_managed_admission(&conn)?;
         let peer_identity = conn.get_network_identity();
         let peer_network_name = peer_identity.network_name.clone();
         let local_identity = self.context.network_identity();
@@ -2341,7 +2382,19 @@ impl PeerMaintenanceTasks {
         let peer_map = self.peer_map.clone();
         tasks.lock().await.spawn(async move {
             loop {
-                if context.network_identity().network_secret.is_some() {
+                if context.flags().managed_peer_auth_required {
+                    if context.remove_expired_credentials() {
+                        context.issue_credential_changed();
+                    }
+                    for peer_id in peer_map.list_peers() {
+                        let allowed = peer_map.get_peer_public_key(peer_id).is_some_and(|key| {
+                            key.len() == 32 && context.is_managed_pubkey_authorized(&key)
+                        });
+                        if !allowed {
+                            let _ = peer_map.close_peer(peer_id).await;
+                        }
+                    }
+                } else if context.network_identity().network_secret.is_some() {
                     if context.remove_expired_credentials() {
                         context.issue_credential_changed();
                     }
@@ -2429,6 +2482,7 @@ pub(crate) struct PeerOutboundPacketRouter {
     recent_traffic: RecentTrafficTracker,
     traffic_metrics: Arc<TrafficMetricRecorder>,
     acl_filter: Arc<AclFilter>,
+    service_flows: Arc<ServiceFlowCollector>,
     is_secure_mode_enabled: bool,
     counters: PeerOutboundPacketRouterCounters,
 }
@@ -2449,6 +2503,7 @@ impl PeerOutboundPacketRouter {
         recent_traffic: RecentTrafficTracker,
         traffic_metrics: Arc<TrafficMetricRecorder>,
         acl_filter: Arc<AclFilter>,
+        service_flows: Arc<ServiceFlowCollector>,
         is_secure_mode_enabled: bool,
         self_tx_packets: CounterHandle,
         self_tx_bytes: CounterHandle,
@@ -2471,6 +2526,7 @@ impl PeerOutboundPacketRouter {
             recent_traffic,
             traffic_metrics,
             acl_filter,
+            service_flows,
             is_secure_mode_enabled,
             counters: PeerOutboundPacketRouterCounters {
                 self_tx_packets,
@@ -2511,6 +2567,12 @@ impl PeerOutboundPacketRouter {
             |_| false,
             self.route.as_ref(),
         ) {
+            self.service_flows.observe_packet(
+                data,
+                FlowDirection::Outbound,
+                data.get_dst_peer_id().filter(|p| *p != 0),
+                true,
+            );
             return false;
         }
 
@@ -2521,6 +2583,12 @@ impl PeerOutboundPacketRouter {
             }
         }
 
+        self.service_flows.observe_packet(
+            data,
+            FlowDirection::Outbound,
+            data.get_dst_peer_id().filter(|p| *p != 0),
+            false,
+        );
         true
     }
 
@@ -2602,6 +2670,8 @@ impl PeerOutboundPacketRouter {
         mut msg: ZCPacket,
         dst_peer_id: PeerId,
     ) -> Result<(), Error> {
+        self.service_flows
+            .observe_packet(&msg, FlowDirection::Outbound, Some(dst_peer_id), false);
         let packet_policy = self.context.packet_policy();
         self.mark_recent_traffic_with_policy(dst_peer_id, packet_policy);
         self.check_p2p_only_before_send(dst_peer_id, packet_policy)?;
@@ -2898,6 +2968,7 @@ pub(crate) struct PeerPacketRouter {
     encryptor: Arc<dyn Encryptor>,
     compress_algo: CompressorAlgo,
     acl_filter: Arc<AclFilter>,
+    service_flows: Arc<ServiceFlowCollector>,
     context: ArcPeerContext,
     secure_mode_enabled: bool,
     route: ArcRoute,
@@ -2920,6 +2991,7 @@ impl PeerPacketRouter {
         encryptor: Arc<dyn Encryptor>,
         compress_algo: CompressorAlgo,
         acl_filter: Arc<AclFilter>,
+        service_flows: Arc<ServiceFlowCollector>,
         context: ArcPeerContext,
         secure_mode_enabled: bool,
         route: ArcRoute,
@@ -2944,6 +3016,7 @@ impl PeerPacketRouter {
             encryptor,
             compress_algo,
             acl_filter,
+            service_flows,
             context,
             secure_mode_enabled,
             route,
@@ -3014,6 +3087,14 @@ impl PeerPacketRouter {
         ingress: PeerPacketIngress,
     ) {
         let buf_len = ret.buf_len();
+        if ret
+            .peer_manager_header()
+            .is_some_and(|h| h.packet_type == PacketType::Data as u8)
+            && let Some((peer_id, connection_id)) = ingress.peer_connection()
+        {
+            self.service_flows
+                .observe_ingress(peer_id, connection_id, buf_len);
+        }
         let destination_is_attached = ret
             .peer_manager_header()
             .is_some_and(|header| self.peers.has_direct_attached_peer(header.to_peer_id.get()));
@@ -3034,6 +3115,22 @@ impl PeerPacketRouter {
         let to_peer_id = hdr.to_peer_id.get();
         let packet_type = hdr.packet_type;
         let is_encrypted = hdr.is_encrypted();
+        let bootstrap_packet = matches!(packet_type,x if x==PacketType::NoiseHandshakeMsg1 as u8 || x==PacketType::NoiseHandshakeMsg2 as u8 || x==PacketType::NoiseHandshakeMsg3 as u8 || x==PacketType::RelayHandshake as u8 || x==PacketType::RelayHandshakeAck as u8 || x==PacketType::Ping as u8 || x==PacketType::Pong as u8);
+        if self.context.flags().managed_peer_auth_required && !bootstrap_packet && !is_encrypted {
+            let direct = ingress.peer_connection().is_some_and(|(peer_id, _)| {
+                peer_id == from_peer_id
+                    && self
+                        .peers
+                        .get_peer_public_key(peer_id)
+                        .is_some_and(|key| self.context.is_managed_pubkey_authorized(&key))
+            });
+            let local =
+                matches!(ingress, PeerPacketIngress::Local) && from_peer_id == self.my_peer_id;
+            if !direct && !local {
+                tracing::warn!("managed packet discarded: no authenticated origin proof");
+                return;
+            }
+        }
         if to_peer_id != self.my_peer_id {
             if drop_relay_data {
                 let ingress_connection = ingress.peer_connection();
@@ -3052,8 +3149,26 @@ impl PeerPacketRouter {
                 return;
             }
 
-            // Step 10b: credential nodes don't forward handshake packets
+            // Legacy credential nodes cannot relay handshakes. Managed relays
+            // may do so only when the current local signed grant authorizes it;
+            // possessing a key or merely changing local flags is insufficient.
+            let managed_relay = self.context.flags().managed_peer_auth_required
+                && !disable_relay_data
+                && self
+                    .context
+                    .secure_mode()
+                    .and_then(|config| config.public_key().ok())
+                    .is_some_and(|key| {
+                        self.context
+                            .managed_credential_grants()
+                            .is_some_and(|grants| {
+                                grants.iter().any(|grant| {
+                                    grant.pubkey.as_slice() == key.as_bytes() && grant.allow_relay
+                                })
+                            })
+                    });
             if self.is_credential_node
+                && !managed_relay
                 && (packet_type == PacketType::HandShake as u8
                     || packet_type == PacketType::NoiseHandshakeMsg1 as u8
                     || packet_type == PacketType::NoiseHandshakeMsg2 as u8
@@ -3172,8 +3287,20 @@ impl PeerPacketRouter {
                 |dst| self.context.is_ip_local_ipv6(&dst),
                 self.route.as_ref(),
             ) {
+                self.service_flows.observe_packet(
+                    &ret,
+                    FlowDirection::Inbound,
+                    Some(from_peer_id),
+                    true,
+                );
                 return;
             }
+            self.service_flows.observe_packet(
+                &ret,
+                FlowDirection::Inbound,
+                Some(from_peer_id),
+                false,
+            );
 
             let mut processed = false;
             let mut zc_packet = Some(ret);
@@ -3686,6 +3813,155 @@ mod tests {
         PeerManagerCore::new_portable_for_test(config, packet_tx)
     }
 
+    struct ControlTestReceiver(tokio::sync::mpsc::UnboundedSender<Vec<u8>>);
+    #[async_trait::async_trait]
+    impl PeerPacketFilter for ControlTestReceiver {
+        async fn try_process_packet_from_peer(&self, packet: ZCPacket) -> Option<ZCPacket> {
+            if packet
+                .peer_manager_header()
+                .is_some_and(|h| h.packet_type == PacketType::RpcReq as u8)
+            {
+                let _ = self.0.send(packet.payload().to_vec());
+                None
+            } else {
+                Some(packet)
+            }
+        }
+    }
+
+    struct FlowTestReceiver(tokio::sync::mpsc::UnboundedSender<Vec<u8>>);
+
+    #[async_trait::async_trait]
+    impl PeerPacketFilter for FlowTestReceiver {
+        async fn try_process_packet_from_peer(&self, packet: ZCPacket) -> Option<ZCPacket> {
+            if packet
+                .peer_manager_header()
+                .is_some_and(|h| h.packet_type == PacketType::Data as u8)
+            {
+                self.0.send(packet.payload().to_vec()).unwrap();
+                None
+            } else {
+                Some(packet)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn service_flows_observe_real_native_ring_dataplane_tcp_udp() {
+        let left = build_portable_for_test(portable_runtime_config("flow-transport-test")).unwrap();
+        let right =
+            build_portable_for_test(portable_runtime_config("flow-transport-test")).unwrap();
+        left.run().await.unwrap();
+        right.run().await.unwrap();
+        let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
+        right
+            .add_packet_process_pipeline(Box::new(FlowTestReceiver(sender)))
+            .await;
+        let (client_tunnel, server_tunnel) = crate::tunnel::ring::create_ring_tunnel_pair();
+        let (client, server) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                left.add_client_tunnel(client_tunnel),
+                right.add_tunnel_as_server(server_tunnel)
+            )
+        })
+        .await
+        .unwrap();
+        client.unwrap();
+        server.unwrap();
+        for protocol in [6, 17] {
+            let bytes = crate::peers::service_flows::tests::ipv4(
+                protocol,
+                45000,
+                if protocol == 6 { 22 } else { 3389 },
+            );
+            let mut packet = ZCPacket::new_with_payload(&bytes);
+            packet.fill_peer_manager_hdr(
+                left.my_peer_id(),
+                right.my_peer_id(),
+                PacketType::Data as u8,
+            );
+            left.send_msg_for_proxy(packet, right.my_peer_id())
+                .await
+                .unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), received.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                bytes
+            );
+        }
+        let source = left.service_flow_snapshot(256);
+        let destination = right.service_flow_snapshot(256);
+        assert_eq!(source.tracked_flows, 2);
+        assert_eq!(destination.tracked_flows, 2);
+        for row in source.flows {
+            assert_eq!(row.a_to_b.outbound_packets, 1);
+            assert!(matches!(row.ip_protocol, 6 | 17));
+            assert_eq!(
+                row.endpoint_b.port,
+                Some(if row.ip_protocol == 6 { 22 } else { 3389 })
+            );
+        }
+        for row in destination.flows {
+            assert_eq!(row.a_to_b.inbound_packets, 1);
+            assert_eq!(row.last_remote_peer_id, Some(left.my_peer_id()));
+        }
+        assert!(
+            destination
+                .received_attachments
+                .iter()
+                .any(|a| a.peer_id == left.my_peer_id() && a.packets >= 2)
+        );
+        assert_eq!(
+            destination.full_path_status,
+            "unknown_endpoint_observations_only"
+        );
+        left.clear_resources().await;
+        right.clear_resources().await;
+    }
+
+    #[tokio::test]
+    async fn service_flows_nic_hook_does_not_parse_encrypted_or_control_payloads() {
+        let core = build_portable_for_test(portable_runtime_config("flow-nic-test")).unwrap();
+        let bytes = crate::peers::service_flows::tests::ipv4(6, 12345, 22);
+        let mut packet = ZCPacket::new_with_payload(&bytes);
+        packet.fill_peer_manager_hdr(core.my_peer_id(), 0, PacketType::Data as u8);
+        assert!(
+            core.outbound_packet_router
+                .run_nic_packet_process_pipeline(&mut packet)
+                .await
+        );
+        assert_eq!(
+            core.service_flow_snapshot(1).flows[0]
+                .a_to_b
+                .outbound_packets,
+            1
+        );
+        packet
+            .mut_peer_manager_header()
+            .unwrap()
+            .set_encrypted(true);
+        assert!(
+            core.outbound_packet_router
+                .run_nic_packet_process_pipeline(&mut packet)
+                .await
+        );
+        packet.fill_peer_manager_hdr(core.my_peer_id(), 0, PacketType::Ping as u8);
+        assert!(
+            core.outbound_packet_router
+                .run_nic_packet_process_pipeline(&mut packet)
+                .await
+        );
+        assert_eq!(
+            core.service_flow_snapshot(1).flows[0]
+                .a_to_b
+                .outbound_packets,
+            1
+        );
+        core.clear_resources().await;
+    }
+
     #[tokio::test]
     async fn portable_peer_manager_builds_and_stops_from_normalized_config() {
         let runtime = portable_runtime_config("portable-net");
@@ -4001,6 +4277,456 @@ mod tests {
                 String::new(),
             )
         );
+    }
+
+    // Exercise the real Noise admission path with public-key-only control snapshots.
+    async fn public_only_test_pair(expiry: i64) -> (PeerManagerCore, PeerManagerCore) {
+        let mut root_runtime = portable_runtime_config("managed-public-noise");
+        let root_private = StaticSecret::from([19; 32]);
+        root_runtime.secure_mode = Some(crate::proto::common::SecureModeConfig {
+            enabled: true,
+            local_private_key: Some(BASE64_STANDARD.encode(root_private.as_bytes())),
+            local_public_key: Some(
+                BASE64_STANDARD.encode(PublicKey::from(&root_private).as_bytes()),
+            ),
+        });
+        let root = build_portable_for_test(root_runtime).unwrap();
+        let mut leaf_runtime = portable_runtime_config("managed-public-noise");
+        leaf_runtime.network_identity.network_secret = None;
+        leaf_runtime.network_identity.network_secret_digest = None;
+        leaf_runtime.secure_mode = Some(credential_secure_mode());
+        let leaf = build_portable_for_test(leaf_runtime).unwrap();
+        let public = PublicKey::from(&StaticSecret::from([7; 32]));
+        root.credential_manager()
+            .install_initial_managed_credentials(&[crate::config::toml::ManagedCredentialConfig {
+                credential_id: "public-only-leaf".into(),
+                credential_secret: String::new(),
+                credential_public_key: Some(BASE64_STANDARD.encode(public.as_bytes())),
+                groups: vec!["guest".into()],
+                allow_relay: false,
+                allowed_proxy_cidrs: Vec::new(),
+                expiry_unix: expiry,
+                reusable: false,
+            }])
+            .unwrap();
+        root.run().await.unwrap();
+        leaf.run().await.unwrap();
+        (root, leaf)
+    }
+    async fn connect_public_only_pair(
+        root: &PeerManagerCore,
+        leaf: &PeerManagerCore,
+    ) -> (Result<(PeerId, PeerConnId), Error>, Result<(), Error>) {
+        let (client_tunnel, server_tunnel) = crate::tunnel::ring::create_ring_tunnel_pair();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                leaf.add_client_tunnel(client_tunnel),
+                root.add_tunnel_as_server(server_tunnel)
+            )
+        })
+        .await
+        .unwrap()
+    }
+    fn managed_noise_config(key_byte: u8, credential_peer: bool) -> PortablePeerManagerConfig {
+        let mut runtime = portable_runtime_config("managed-admin-noise");
+        runtime.core.node.instance_id = Some([key_byte; 16]);
+        runtime.core.node.hostname = Some(format!("managed-test-{key_byte}"));
+        runtime.core.routes.ipv4 =
+            Some(IpPrefix::new(format!("10.0.0.{key_byte}").parse().unwrap(), 24).unwrap());
+        if credential_peer {
+            runtime.network_identity.network_secret = None;
+            runtime.network_identity.network_secret_digest = None;
+        }
+        let key = StaticSecret::from([key_byte; 32]);
+        runtime.secure_mode = Some(crate::proto::common::SecureModeConfig {
+            enabled: true,
+            local_private_key: Some(BASE64_STANDARD.encode(key.as_bytes())),
+            local_public_key: Some(BASE64_STANDARD.encode(PublicKey::from(&key).as_bytes())),
+        });
+        let mut config = PortablePeerManagerConfig::new(runtime);
+        config.snapshot.flags.managed_peer_auth_required = true;
+        config
+    }
+    fn authorize_managed_key(core: &PeerManagerCore, key_byte: u8, expiry: i64, group: &str) {
+        core.credential_manager()
+            .install_initial_managed_credentials(&[crate::config::toml::ManagedCredentialConfig {
+                credential_id: format!("managed-{key_byte}"),
+                credential_secret: String::new(),
+                credential_public_key: Some(
+                    BASE64_STANDARD
+                        .encode(PublicKey::from(&StaticSecret::from([key_byte; 32])).as_bytes()),
+                ),
+                groups: vec![group.into()],
+                allow_relay: false,
+                allowed_proxy_cidrs: Vec::new(),
+                expiry_unix: expiry,
+                reusable: false,
+            }])
+            .unwrap();
+        core.notify_credential_changed();
+    }
+    #[tokio::test]
+    async fn managed_rootless_credential_relay_carries_multihop_tcp_and_udp() {
+        let time = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let mut nodes = Vec::new();
+        for byte in [7u8, 19, 20] {
+            let mut config = managed_noise_config(byte, true);
+            config.snapshot.flags.disable_relay_data = byte != 19;
+            let node = build_portable_config_for_test(config).unwrap();
+            let credentials: Vec<_> = [7u8, 19, 20]
+                .into_iter()
+                .map(|key| crate::config::toml::ManagedCredentialConfig {
+                    credential_id: format!("rootless-{key}"),
+                    credential_secret: String::new(),
+                    credential_public_key: Some(
+                        BASE64_STANDARD
+                            .encode(PublicKey::from(&StaticSecret::from([key; 32])).as_bytes()),
+                    ),
+                    groups: vec!["members".into()],
+                    allow_relay: key == 19,
+                    allowed_proxy_cidrs: Vec::new(),
+                    expiry_unix: time + 120,
+                    reusable: false,
+                })
+                .collect();
+            node.credential_manager()
+                .install_initial_managed_credentials(&credentials)
+                .unwrap();
+            assert!(node.context.network_identity().network_secret.is_none());
+            node.run().await.unwrap();
+            nodes.push(node);
+        }
+        let source = &nodes[0];
+        let relay = &nodes[1];
+        let destination = &nodes[2];
+        let (client, server) = connect_public_only_pair(relay, source).await;
+        client.unwrap();
+        server.unwrap();
+        let (client, server) = connect_public_only_pair(relay, destination).await;
+        client.unwrap();
+        server.unwrap();
+        let convergence = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let routes = source.list_route_snapshots().await;
+                if routes.iter().any(|r| {
+                    r.peer_id == destination.my_peer_id()
+                        && r.next_hop_peer_id == relay.my_peer_id()
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        if convergence.is_err() {
+            for (label, node) in [
+                ("source", source),
+                ("relay", relay),
+                ("destination", destination),
+            ] {
+                eprintln!(
+                    "rootless convergence {label}: peer_id={} routes={:?} peers={:?} route_state={}",
+                    node.my_peer_id(),
+                    node.list_route_snapshots().await,
+                    node.list_peer_snapshots().await,
+                    node.dump_route().await
+                );
+            }
+            panic!(
+                "rootless source has no route to destination through the middle relay after 15 seconds"
+            );
+        }
+        let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
+        destination
+            .add_packet_process_pipeline(Box::new(FlowTestReceiver(sender)))
+            .await;
+        for protocol in [6, 17] {
+            let mut bytes = crate::peers::service_flows::tests::ipv4(
+                protocol,
+                45000,
+                if protocol == 6 { 22 } else { 3389 },
+            );
+            bytes[12..16].copy_from_slice(&[10, 0, 0, 7]);
+            bytes[16..20].copy_from_slice(&[10, 0, 0, 20]);
+            let mut packet = ZCPacket::new_with_payload(&bytes);
+            packet.fill_peer_manager_hdr(
+                source.my_peer_id(),
+                destination.my_peer_id(),
+                PacketType::Data as u8,
+            );
+            source
+                .send_msg_for_proxy(packet, destination.my_peer_id())
+                .await
+                .unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(15), received.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                bytes
+            );
+        }
+        assert_eq!(destination.service_flow_snapshot(8).tracked_flows, 2);
+        assert_eq!(
+            relay.service_flow_snapshot(8).tracked_flows,
+            0,
+            "relay must not invent decrypted flow tuples"
+        );
+        assert!(
+            !relay
+                .service_flow_snapshot(8)
+                .received_attachments
+                .is_empty()
+        );
+        for node in nodes {
+            node.clear_resources().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_admin_with_known_network_secret_requires_live_exact_public_key() {
+        let time = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let root = build_portable_config_for_test(managed_noise_config(19, false)).unwrap();
+        let admin = build_portable_config_for_test(managed_noise_config(20, false)).unwrap();
+        authorize_managed_key(&root, 20, time + 120, "members");
+        authorize_managed_key(&admin, 19, time + 120, "backbones");
+        root.run().await.unwrap();
+        admin.run().await.unwrap();
+        let (client, server) = connect_public_only_pair(&root, &admin).await;
+        client.unwrap();
+        server.unwrap();
+        assert_eq!(
+            root.peers.get_peer_identity_type(admin.my_peer_id()),
+            Some(PeerIdentityType::Admin)
+        );
+        root.credential_manager()
+            .install_initial_managed_credentials(&[])
+            .unwrap();
+        root.notify_credential_changed();
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while !root.peers.list_peers().is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // The revoked peer still knows the network master secret and can prove
+        // its Noise key, but neither fact overrides the current authority map.
+        let (_, server) = connect_public_only_pair(&root, &admin).await;
+        assert!(server.is_err());
+        root.clear_resources().await;
+        admin.clear_resources().await;
+    }
+    #[tokio::test]
+    async fn managed_guest_cannot_bypass_group_acl_with_forged_admin_source_ip() {
+        use crate::proto::acl::{Acl, AclV1, Chain, Rule};
+        let time = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let mut root_config = managed_noise_config(19, false);
+        root_config.snapshot.runtime.core.routes.ipv4 =
+            Some(IpPrefix::new("10.0.0.2".parse().unwrap(), 24).unwrap());
+        let root = build_portable_config_for_test(root_config).unwrap();
+        let guest = build_portable_config_for_test(managed_noise_config(7, true)).unwrap();
+        authorize_managed_key(&root, 7, time + 120, "guest");
+        authorize_managed_key(&guest, 19, time + 120, "backbones");
+        root.run().await.unwrap();
+        guest.run().await.unwrap();
+        let (client, server) = connect_public_only_pair(&root, &guest).await;
+        client.unwrap();
+        server.unwrap();
+        let acl = |group: &str| Acl {
+            acl_v1: Some(AclV1 {
+                chains: vec![Chain {
+                    name: "inbound".into(),
+                    chain_type: 1,
+                    enabled: true,
+                    default_action: 2,
+                    rules: vec![Rule {
+                        name: "ssh-authenticated-group".into(),
+                        priority: 100,
+                        enabled: true,
+                        protocol: 1,
+                        ports: vec!["22".into()],
+                        source_ips: vec!["10.0.0.1/32".into()],
+                        source_groups: vec![group.into()],
+                        action: 1,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        };
+        // The malicious approved guest forges the IP allowed for an admin.
+        let bytes = crate::peers::service_flows::tests::ipv4(6, 45000, 22);
+        let mut packet = ZCPacket::new_with_payload(&bytes);
+        packet.fill_peer_manager_hdr(
+            guest.my_peer_id(),
+            root.my_peer_id(),
+            PacketType::Data as u8,
+        );
+        let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
+        root.add_packet_process_pipeline(Box::new(FlowTestReceiver(sender)))
+            .await;
+        root.acl_filter.reload_rules(Some(&acl("admin")));
+        guest
+            .send_msg_for_proxy(packet, root.my_peer_id())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), received.recv())
+                .await
+                .is_err(),
+            "forged admin IP bypassed authenticated group predicate"
+        );
+        assert!(
+            root.service_flow_snapshot(8)
+                .flows
+                .iter()
+                .any(|row| row.acl_drop_observed)
+        );
+        // Removing only the group condition admits the same forged bytes,
+        // proving an authenticated group denial, not a malformed-packet failure.
+        let mut ip_only = acl("admin");
+        ip_only.acl_v1.as_mut().unwrap().chains[0].rules[0]
+            .source_groups
+            .clear();
+        root.acl_filter.reload_rules(Some(&ip_only));
+        let mut packet = ZCPacket::new_with_payload(&bytes);
+        packet.fill_peer_manager_hdr(
+            guest.my_peer_id(),
+            root.my_peer_id(),
+            PacketType::Data as u8,
+        );
+        guest
+            .send_msg_for_proxy(packet, root.my_peer_id())
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), received.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            bytes
+        );
+        // Deliberately lie about the overlay header source. The per-connection
+        // filter does not decrypt this mismatched source, so it reaches the
+        // router as plaintext. Managed mode must reject it before the ACL.
+        let mut forged = ZCPacket::new_with_payload(&bytes);
+        forged.fill_peer_manager_hdr(
+            guest.my_peer_id() ^ 0x80000000,
+            root.my_peer_id(),
+            PacketType::Data as u8,
+        );
+        guest
+            .send_msg_for_proxy(forged, root.my_peer_id())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), received.recv())
+                .await
+                .is_err(),
+            "plaintext forged overlay source was accepted"
+        );
+        let (control_sender, mut control_received) = tokio::sync::mpsc::unbounded_channel();
+        root.add_packet_process_pipeline(Box::new(ControlTestReceiver(control_sender)))
+            .await;
+        let mut spoofed_rpc = ZCPacket::new_with_payload(b"spoofed-control-body");
+        spoofed_rpc.fill_peer_manager_hdr(
+            guest.my_peer_id() ^ 0x80000000,
+            root.my_peer_id(),
+            PacketType::RpcReq as u8,
+        );
+        guest
+            .send_msg_for_proxy(spoofed_rpc, root.my_peer_id())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), control_received.recv())
+                .await
+                .is_err(),
+            "plaintext forged RPC origin reached control pipeline"
+        );
+        let mut real_rpc = ZCPacket::new_with_payload(b"authenticated-control-body");
+        real_rpc.fill_peer_manager_hdr(
+            guest.my_peer_id(),
+            root.my_peer_id(),
+            PacketType::RpcReq as u8,
+        );
+        guest
+            .send_msg_for_proxy(real_rpc, root.my_peer_id())
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), control_received.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            b"authenticated-control-body"
+        );
+        root.clear_resources().await;
+        guest.clear_resources().await;
+    }
+
+    #[tokio::test]
+    async fn managed_public_only_noise_admission_and_active_revoke() {
+        let time = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let (root, leaf) = public_only_test_pair(time + 120).await;
+        let (client, server) = connect_public_only_pair(&root, &leaf).await;
+        client.unwrap();
+        server.unwrap();
+        assert!(!root.peers.list_peers().is_empty());
+        root.credential_manager()
+            .install_initial_managed_credentials(&[])
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while !root.peers.list_peers().is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        root.clear_resources().await;
+        leaf.clear_resources().await;
+    }
+    #[tokio::test]
+    async fn managed_public_only_noise_rejects_unknown_key_and_expires_active_peer() {
+        let time = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let (root, leaf) = public_only_test_pair(time + 3).await;
+        let (client, server) = connect_public_only_pair(&root, &leaf).await;
+        client.unwrap();
+        server.unwrap();
+        tokio::time::timeout(Duration::from_secs(6), async {
+            while !root.peers.list_peers().is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !root
+                .credential_manager()
+                .is_pubkey_trusted(PublicKey::from(&StaticSecret::from([7; 32])).as_bytes())
+        );
+        // Same overlay network name is not authorization after the key lease expires.
+        let (client, server) = connect_public_only_pair(&root, &leaf).await;
+        assert!(client.is_err() || server.is_err());
+        root.clear_resources().await;
+        leaf.clear_resources().await;
     }
 
     #[tokio::test]
